@@ -1,12 +1,15 @@
-"""Generic IMAP connection, folder listing, and header extraction."""
+"""Generic IMAP connection, folder listing, and contact extraction."""
 import imaplib
 import re
 from dataclasses import dataclass
+from email import policy
 from email.header import decode_header
+from email.parser import BytesParser
 from email.utils import getaddresses, parsedate_to_datetime
 
 SKIP_HINTS = ("spam", "junk", "trash", "bin", "deleted")
 FETCH_BATCH_SIZE = 1000
+MESSAGE_BATCH_SIZE = 20
 
 FOLDER_LINE_RE = re.compile(r'\((?P<flags>[^)]*)\)\s+"(?P<delim>[^"]*)"\s+(?P<name>.+)')
 
@@ -172,6 +175,65 @@ def fetch_header_batches(
             for part in data
             if isinstance(part, tuple) and len(part) > 1
         ]
+
+
+def fetch_message_batches(
+    conn: imaplib.IMAP4, msg_uids: list[bytes], batch_size: int = MESSAGE_BATCH_SIZE
+):
+    """Fetch complete messages without marking them read, yielding completed batches."""
+    # ponytail: whole-message fetch keeps IMAP generic; use BODYSTRUCTURE if traffic matters.
+    for i in range(0, len(msg_uids), batch_size):
+        batch = msg_uids[i : i + batch_size]
+        status, data = conn.uid("fetch", b",".join(batch), "(BODY.PEEK[])")
+        if status != "OK":
+            raise ImapError("UID FETCH failed")
+        messages = [
+            part[1]
+            for part in data
+            if isinstance(part, tuple) and len(part) > 1
+        ]
+        if len(messages) != len(batch):
+            raise ImapError("UID FETCH returned an incomplete batch")
+        yield batch, messages
+
+
+def parse_message(raw_message: bytes) -> tuple[list[tuple[str, str]], str, str, str, str]:
+    """Return addresses, date, sender address, body text, and body subtype."""
+    message = BytesParser(policy=policy.default).parsebytes(raw_message)
+    addresses = []
+    for key in ("from", "to", "cc"):
+        addresses.extend(
+            (name.strip(), addr.strip())
+            for name, addr in getaddresses([str(value) for value in message.get_all(key, [])])
+            if addr
+        )
+    senders = getaddresses([str(value) for value in message.get_all("from", [])])
+    sender = senders[0][1].strip() if senders else ""
+    date = ""
+    if message.get("date"):
+        try:
+            date = parsedate_to_datetime(str(message["date"])).isoformat()
+        except (TypeError, ValueError):
+            pass
+    part = message.get_body(preferencelist=("plain", "html"))
+    if not part:
+        return addresses, date, sender, "", ""
+    body = part.get_content()
+    return addresses, date, sender, body if isinstance(body, str) else "", part.get_content_subtype()
+
+
+def extract_signature(body: str, subtype: str, sender: str) -> str:
+    """Extract the current sender's signature from decoded plain text or HTML."""
+    from talon import quotations, signature
+    from talon.utils import html_to_text
+
+    if subtype == "html":
+        body = html_to_text(body) or ""
+    if not body:
+        return ""
+    body = quotations.extract_from_plain(body)
+    _, found = signature.extract(body, sender=sender)
+    return found.strip() if found else ""
 
 
 def parse_addresses(raw_headers: str) -> list[tuple[str, str]]:

@@ -1,1 +1,2 @@
 textual>=0.80.0
+talon @ git+https://github.com/spaquet/talon.git@330b960c20e8634a60578346d94c229957e09d2e

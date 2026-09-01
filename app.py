@@ -420,6 +420,15 @@ class RunScreen(Screen):
         store = ContactStore(self.db_path)
         progress = self.query_one("#progress", ProgressBar)
         status = self.query_one("#folder_status", Static)
+        try:
+            import talon
+
+            talon.init()
+        except Exception as e:
+            store.close()
+            self.done = True
+            self.app.call_from_thread(status.update, f"[red]Talon failed to start: {e}[/red]")
+            return
 
         total_folders = len(self.folders)
         for fi, folder in enumerate(self.folders, start=1):
@@ -437,6 +446,12 @@ class RunScreen(Screen):
                     "to avoid double-counting.[/red]"
                 )
                 continue
+            if checkpoint and checkpoint[1] > 0:
+                self.append_log(
+                    f"[yellow]{folder}: already scanned up to UID {checkpoint[1]}; "
+                    "signatures for messages before that point are not backfilled. "
+                    "Use a fresh database to capture historical signatures.[/yellow]"
+                )
 
             last_uid = checkpoint[1] if checkpoint else 0
             try:
@@ -449,14 +464,25 @@ class RunScreen(Screen):
             self.app.call_from_thread(progress.update, total=len(uids) or 1, progress=0)
             done = 0
             try:
-                for batch, headers in im.fetch_header_batches(self.conn, uids):
-                    for raw_headers in headers:
-                        date = im.parse_date(raw_headers)
-                        for name, addr in im.parse_addresses(raw_headers):
+                for batch, messages in im.fetch_message_batches(self.conn, uids):
+                    for raw_message in messages:
+                        try:
+                            addresses, date, sender, body, subtype = im.parse_message(raw_message)
+                            found_signature = im.extract_signature(body, subtype, sender)
+                        except Exception as e:
+                            self.append_log(f"[yellow]{folder}: skipped unparseable message: {e}[/yellow]")
+                            continue
+                        for name, addr in addresses:
                             domain = addr.split("@")[-1].lower() if "@" in addr else ""
                             if domain in self.excluded_domains:
                                 continue
-                            store.record(addr, name, folder, date)
+                            store.record(
+                                addr,
+                                name,
+                                folder,
+                                date,
+                                found_signature if addr.lower() == sender.lower() else "",
+                            )
                     done += len(batch)
                     self.app.call_from_thread(progress.update, progress=done)
             except im.ImapError as e:

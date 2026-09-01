@@ -7,7 +7,7 @@ TUI to scan your IMAP mailbox and extract every name + email address you've corr
 ## Features
 
 - Connects to any IMAP server; credentials are never saved.
-- Extracts contacts from `From`, `To`, and `Cc` headers without storing messages or raw headers.
+- Extracts contacts from `From`, `To`, and `Cc` headers and uses Talon to detect sender signatures.
 - Resumes scans incrementally using per-folder UID checkpoints.
 - Supports folder selection and persistent domain exclusions.
 - Deduplicates contacts, tracks message counts and dates, and keeps the most frequently seen name.
@@ -52,6 +52,8 @@ The output is a SQLite file in WAL mode and is libsql-compatible. Use a separate
 | `message_count` | number of messages the address appeared in (From/To/Cc) |
 | `folders` | comma-separated folders it was seen in |
 | `first_seen` / `last_seen` | ISO timestamps from message `Date` headers |
+| `signature` | latest dated signature Talon extracted for this sender |
+| `signature_seen` | ISO timestamp of the message that supplied the signature |
 
 ### `extraction_state`
 
@@ -67,7 +69,7 @@ Internal checkpoints used to make later scans incremental:
 
 `host`, `username`, and `folder` form the primary key. Contact updates and their checkpoint are committed in one transaction, so an interrupted scan cannot advance past unsaved contacts. If `uidvalidity` changes, the folder is skipped and the app asks for a fresh database rather than risking duplicate counts.
 
-No passwords, message bodies, or raw headers are stored in either table.
+No passwords, message bodies, raw messages, or raw headers are stored in either table.
 
 To push into Turso cloud:
 
@@ -77,5 +79,6 @@ turso db shell <your-db> < <(sqlite3 contacts.db .dump)
 
 ## Notes
 
-- Extracts from `From`, `To`, and `Cc` headers of every message in the selected folders.
+- Extracts contacts and sender signatures from every message in the selected folders.
+- Existing incremental databases only scan signatures in new messages; use a fresh database to backfill historical signatures.
 - Credentials are prompted each run, never written to disk. Non-secret settings (excluded domains, last host/user, db path) persist in `~/.config/email_extract/config.json`.

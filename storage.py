@@ -14,7 +14,9 @@ CREATE TABLE IF NOT EXISTS contacts (
     message_count INTEGER NOT NULL DEFAULT 0,
     folders TEXT NOT NULL DEFAULT '',
     first_seen TEXT,
-    last_seen TEXT
+    last_seen TEXT,
+    signature TEXT,
+    signature_seen TEXT
 );
 """
 
@@ -49,6 +51,10 @@ class ContactStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(SCHEMA)
         self._conn.execute(STATE_SCHEMA)
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(contacts)")}
+        for column in ("signature", "signature_seen"):
+            if column not in columns:
+                self._conn.execute(f"ALTER TABLE contacts ADD COLUMN {column} TEXT")
         self._conn.commit()
         # per-email tally of {display_name: occurrence_count}, used to pick
         # the most-frequent name for that address at flush() time
@@ -57,8 +63,16 @@ class ContactStore:
         self._folders: dict[str, set] = defaultdict(set)
         self._first_seen: dict[str, str] = {}
         self._last_seen: dict[str, str] = {}
+        self._signatures: dict[str, tuple[str, str]] = {}
 
-    def record(self, email: str, name: str, folder: str, date: str = ""):
+    def record(
+        self,
+        email: str,
+        name: str,
+        folder: str,
+        date: str = "",
+        signature: str = "",
+    ):
         """Register one occurrence of an address in a message.
 
         Buffered in memory only; call flush() to write to the database.
@@ -69,6 +83,7 @@ class ContactStore:
             name: Display name paired with the address in that header, if any.
             folder: IMAP folder the message was found in.
             date: ISO-8601 message date, if it could be parsed.
+            signature: Signature extracted from a message sent by this address.
         """
         email = email.lower().strip()
         if not email:
@@ -82,6 +97,9 @@ class ContactStore:
                 self._first_seen[email] = date
             if email not in self._last_seen or date > self._last_seen[email]:
                 self._last_seen[email] = date
+        previous = self._signatures.get(email)
+        if signature and (not previous or (date and (not previous[1] or date >= previous[1]))):
+            self._signatures[email] = (signature, date)
 
     def checkpoint(self, host: str, username: str, folder: str) -> tuple[str, int] | None:
         """Return the saved (UIDVALIDITY, last UID) for one account folder."""
@@ -108,16 +126,40 @@ class ContactStore:
                 names = self._name_counts.get(email, {})
                 best_name = max(names.items(), key=lambda kv: kv[1])[0] if names else None
                 folders = ",".join(sorted(self._folders[email]))
+                signature, signature_seen = self._signatures.get(email, (None, None))
                 cur.execute(
                     """
-                    INSERT INTO contacts (email, name, message_count, folders, first_seen, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO contacts (
+                        email, name, message_count, folders, first_seen, last_seen,
+                        signature, signature_seen
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(email) DO UPDATE SET
                         name = CASE WHEN excluded.name IS NOT NULL THEN excluded.name ELSE contacts.name END,
                         message_count = contacts.message_count + excluded.message_count,
                         folders = excluded.folders,
                         first_seen = MIN(COALESCE(contacts.first_seen, excluded.first_seen), excluded.first_seen),
-                        last_seen = MAX(COALESCE(contacts.last_seen, excluded.last_seen), excluded.last_seen)
+                        last_seen = MAX(COALESCE(contacts.last_seen, excluded.last_seen), excluded.last_seen),
+                        signature = CASE
+                            WHEN excluded.signature IS NULL THEN contacts.signature
+                            WHEN contacts.signature IS NULL THEN excluded.signature
+                            WHEN excluded.signature_seen != '' AND
+                                 (contacts.signature_seen IS NULL OR
+                                  contacts.signature_seen = '' OR
+                                  excluded.signature_seen >= contacts.signature_seen)
+                            THEN excluded.signature
+                            ELSE contacts.signature
+                        END,
+                        signature_seen = CASE
+                            WHEN excluded.signature IS NULL THEN contacts.signature_seen
+                            WHEN contacts.signature IS NULL THEN excluded.signature_seen
+                            WHEN excluded.signature_seen != '' AND
+                                 (contacts.signature_seen IS NULL OR
+                                  contacts.signature_seen = '' OR
+                                  excluded.signature_seen >= contacts.signature_seen)
+                            THEN excluded.signature_seen
+                            ELSE contacts.signature_seen
+                        END
                     """,
                     (
                         email,
@@ -126,6 +168,8 @@ class ContactStore:
                         folders,
                         self._first_seen.get(email, ""),
                         self._last_seen.get(email, ""),
+                        signature,
+                        signature_seen,
                     ),
                 )
             if checkpoint:
@@ -149,6 +193,7 @@ class ContactStore:
         self._folders.clear()
         self._first_seen.clear()
         self._last_seen.clear()
+        self._signatures.clear()
 
     def close(self):
         """Close the underlying sqlite connection."""
@@ -251,7 +296,8 @@ class ContactStore:
         where_sql, params = self._build_where(search, date_from, date_to, folder)
         rows = self._conn.execute(
             f"""
-            SELECT email, name, message_count, folders, first_seen, last_seen
+            SELECT email, name, message_count, folders, first_seen, last_seen,
+                   signature, signature_seen
             FROM contacts{where_sql}
             ORDER BY name
             """,
@@ -259,6 +305,9 @@ class ContactStore:
         ).fetchall()
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["email", "name", "message_count", "folders", "first_seen", "last_seen"])
+            writer.writerow([
+                "email", "name", "message_count", "folders", "first_seen",
+                "last_seen", "signature", "signature_seen",
+            ])
             writer.writerows(rows)
         return len(rows)
