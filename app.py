@@ -186,7 +186,7 @@ class ConnectScreen(Screen):
 
 
 class FolderScreen(Screen):
-    """Second screen: pick which mailboxes to scan.
+    """Second screen: choose the output database and mailboxes to scan.
 
     Folders that look like Spam/Trash/Junk (Folder.looks_excludable) start
     unchecked; every folder is shown so the user can override.
@@ -200,6 +200,8 @@ class FolderScreen(Screen):
         self.folders = folders
         self.username = username
         self.host = host
+        self.cfg = cfgmod.load()
+        self.suggested_db = default_db_name(username, host)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -212,6 +214,17 @@ class FolderScreen(Screen):
             "for speed; otherwise spam/trash-like folders are pre-unchecked.",
             classes="title",
         )
+        yield Label("Output sqlite/libsql file path")
+        yield Static(
+            "Contacts and extraction checkpoints are stored here; use a different file per mailbox.",
+            classes="hint",
+        )
+        db_default = (
+            self.cfg["db_path"]
+            if self.cfg["db_path"] not in ("", "contacts.db", "test.db")
+            else self.suggested_db
+        )
+        yield Input(value=db_default, id="db_path")
         selections = [
             Selection(
                 folder.name,
@@ -229,11 +242,20 @@ class FolderScreen(Screen):
             selected = self.query_one("#folders", SelectionList).selected
             if not selected:
                 return
-            self.app.push_screen(DomainScreen(self.conn, list(selected), self.username, self.host))
+            db_path = self.query_one("#db_path", Input).value.strip() or self.suggested_db
+            self.app.push_screen(
+                DomainScreen(
+                    self.conn,
+                    list(selected),
+                    self.username,
+                    self.host,
+                    db_path,
+                )
+            )
 
 
 class DomainScreen(Screen):
-    """Third screen: maintain the excluded-domain list and output db path.
+    """Third screen: maintain the excluded-domain list.
 
     The domain list is seeded from and saved back to config, so it persists
     across runs.
@@ -241,15 +263,22 @@ class DomainScreen(Screen):
 
     BINDINGS = [("escape", "app.pop_screen", "Back"), ("d", "remove_selected", "Remove domain")]
 
-    def __init__(self, conn: imaplib.IMAP4, folders: list[str], username: str, host: str):
+    def __init__(
+        self,
+        conn: imaplib.IMAP4,
+        folders: list[str],
+        username: str,
+        host: str,
+        db_path: str,
+    ):
         super().__init__()
         self.conn = conn
         self.folders = folders
         self.username = username
         self.host = host
+        self.db_path = db_path
         self.cfg = cfgmod.load()
         self.domains = list(self.cfg["excluded_domains"])
-        self.suggested_db = default_db_name(username, host)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -259,14 +288,6 @@ class DomainScreen(Screen):
             yield Button("Add", id="add_domain")
         yield ListView(*[ListItem(Label(d)) for d in self.domains], id="domain_list")
         yield Static("Select a row + press 'd' to remove.", classes="hint")
-        yield Label("Output sqlite/libsql file path")
-        yield Static(
-            "Different mailboxes should usually use different db files "
-            "(contacts dedupe globally by email address within one file).",
-            classes="hint",
-        )
-        db_default = self.cfg["db_path"] if self.cfg["db_path"] not in ("", "contacts.db", "test.db") else self.suggested_db
-        yield Input(value=db_default, id="db_path")
         yield Button("Start scan", id="continue", variant="primary")
         yield Footer()
 
@@ -288,14 +309,15 @@ class DomainScreen(Screen):
                 self.query_one("#domain_list", ListView).append(ListItem(Label(val)))
             inp.value = ""
         elif event.button.id == "continue":
-            db_path = self.query_one("#db_path", Input).value.strip() or self.cfg["db_path"]
-            cfgmod.save({**self.cfg, "excluded_domains": self.domains, "db_path": db_path})
+            cfgmod.save(
+                {**self.cfg, "excluded_domains": self.domains, "db_path": self.db_path}
+            )
             self.app.push_screen(
                 RunScreen(
                     self.conn,
                     self.folders,
                     self.domains,
-                    db_path,
+                    self.db_path,
                     self.host,
                     self.username,
                 )

@@ -21,16 +21,18 @@ Start screen offers two paths:
 
 - **Extract from IMAP**
   1. **Connect** — enter IMAP host, port, username, password (any provider; nothing is saved to disk).
-  2. **Folders** — pick which folders to scan. Folders that look like Spam/Trash/Junk/Bin are pre-unchecked but shown so you can override.
-  3. **Domain filter** — add/remove domains to exclude (e.g. `noreply.github.com`); saved for next run. Set the output db file path here too.
+  2. **Folders and database** — choose the output database and folders to scan. A server-designated All Mail folder is selected alone by default for speed; otherwise Spam/Trash/Junk/Bin-like folders are pre-unchecked.
+  3. **Domain filter** — add/remove domains to exclude (e.g. `noreply.github.com`); saved for next run.
   4. **Run** — live progress per folder + overall, then a summary of unique contacts written.
 - **Browse contacts db** — open an existing output db, search by name/email, filter by date range or folder, page through results, and export the current filtered set to CSV.
 
 Change theme any time via the command palette (`ctrl+p`).
 
-## Output
+## Database
 
-A sqlite file (default `./contacts.db`), libsql-compatible, with a `contacts` table:
+The output is a SQLite file in WAL mode and is libsql-compatible. Use a separate file per mailbox because contacts are deduplicated across the entire database. It contains two tables.
+
+### `contacts`
 
 | column | meaning |
 |---|---|
@@ -39,6 +41,22 @@ A sqlite file (default `./contacts.db`), libsql-compatible, with a `contacts` ta
 | `message_count` | number of messages the address appeared in (From/To/Cc) |
 | `folders` | comma-separated folders it was seen in |
 | `first_seen` / `last_seen` | ISO timestamps from message `Date` headers |
+
+### `extraction_state`
+
+Internal checkpoints used to make later scans incremental:
+
+| column | meaning |
+|---|---|
+| `host` | IMAP server hostname |
+| `username` | IMAP account username |
+| `folder` | mailbox name |
+| `uidvalidity` | server generation identifier for the mailbox |
+| `last_uid` | highest message UID successfully extracted |
+
+`host`, `username`, and `folder` form the primary key. Contact updates and their checkpoint are committed in one transaction, so an interrupted scan cannot advance past unsaved contacts. If `uidvalidity` changes, the folder is skipped and the app asks for a fresh database rather than risking duplicate counts.
+
+No passwords, message bodies, or raw headers are stored in either table.
 
 To push into Turso cloud:
 

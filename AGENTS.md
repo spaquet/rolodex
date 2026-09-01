@@ -5,9 +5,15 @@ Config (`~/.config/email_extract/config.json`): excluded domains, last host/port
 
 Files:
 - `app.py` — Textual screens: Start → (Connect → Folder select → Domain filter → Run) or Browse (search/filter/paginate/export)
-- `imap_client.py` — generic IMAP: connect, list folders, fetch From/To/Cc/Date headers
-- `storage.py` — sqlite/libsql-compatible output, upsert contacts (most-frequent name wins)
+- `imap_client.py` — generic IMAP: connect, list folders, incrementally fetch From/To/Cc/Date headers by UID
+- `storage.py` — sqlite/libsql-compatible contacts and extraction checkpoints
 - `config.py` — non-secret settings persistence
+
+Database (SQLite WAL, libsql-compatible; use one file per mailbox):
+- `contacts` — `email TEXT PRIMARY KEY`, `name`, `message_count`, comma-separated `folders`, `first_seen`, `last_seen`; most-frequent name wins.
+- `extraction_state` — `host`, `username`, `folder`, `uidvalidity`, `last_uid`; primary key is (`host`, `username`, `folder`). This is internal scan state, not contact data.
+- Contact changes and their extraction checkpoint must commit in the same transaction. Never advance `last_uid` separately.
+- Never store passwords, message bodies, or raw headers.
 
 Run: `pip install -r requirements.txt && python app.py`
 
