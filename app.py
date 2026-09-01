@@ -4,6 +4,7 @@ import imaplib
 import re
 import threading
 import time
+from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -13,6 +14,7 @@ from textual.widgets import (
     Button,
     Checkbox,
     DataTable,
+    DirectoryTree,
     Footer,
     Header,
     Input,
@@ -480,6 +482,67 @@ class RunScreen(Screen):
         self.append_log("Press q to quit.")
 
 
+class DatabaseTree(DirectoryTree):
+    def filter_paths(self, paths):
+        return [
+            path
+            for path in paths
+            if path.is_dir() or path.suffix.lower() in (".db", ".sqlite", ".sqlite3")
+        ]
+
+
+class DatabasePicker(ModalScreen[str | None]):
+    """Choose an existing database or name a new one beneath the working directory."""
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, current_path: str):
+        super().__init__()
+        self.directory = Path.cwd()
+        self.filename = Path(current_path).name or "contacts.db"
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="db-picker"):
+            yield Static("Choose database", classes="title")
+            yield Static(str(self.directory), id="picker-directory", markup=False)
+            yield DatabaseTree(self.directory, id="picker-tree")
+            yield Label("File name")
+            yield Input(value=self.filename, placeholder="contacts.db", id="picker-name")
+            with Horizontal(id="picker-actions"):
+                yield Button("Cancel", id="picker-cancel")
+                yield Button("Use database", id="picker-use", variant="primary")
+
+    def on_directory_tree_directory_selected(
+        self, event: DirectoryTree.DirectorySelected
+    ) -> None:
+        self.directory = event.path
+        self.query_one("#picker-directory", Static).update(str(event.path))
+
+    def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
+        self.directory = event.path.parent
+        self.query_one("#picker-directory", Static).update(str(self.directory))
+        self.query_one("#picker-name", Input).value = event.path.name
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "picker-cancel":
+            self.dismiss(None)
+        elif event.button.id == "picker-use":
+            self._use_database()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "picker-name":
+            self._use_database()
+
+    def _use_database(self) -> None:
+        name = self.query_one("#picker-name", Input).value.strip()
+        if name:
+            path = Path(name)
+            self.dismiss(str(path if path.is_absolute() else self.directory / path))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class BrowseScreen(Screen):
     """Browse, search, filter, and export contacts from a local db."""
 
@@ -499,6 +562,7 @@ class BrowseScreen(Screen):
         yield Static("Contacts  ·  results update as you type", classes="title")
         with Horizontal(id="db-row", classes="toolbar"):
             yield Input(value=self.cfg["db_path"], placeholder="contacts.db", id="db_path")
+            yield Button("Choose…", id="choose_db")
             yield Button("Load", id="load", variant="primary")
         with Vertical(id="search-wrap"):
             yield Input(
@@ -527,6 +591,11 @@ class BrowseScreen(Screen):
         button_id = event.button.id
         if button_id == "load":
             self.load_db()
+        elif button_id == "choose_db":
+            self.app.push_screen(
+                DatabasePicker(self.query_one("#db_path", Input).value),
+                self._database_chosen,
+            )
         elif button_id == "prev":
             self.page_offset = max(0, self.page_offset - PAGE_SIZE)
             self.run_search()
@@ -550,6 +619,11 @@ class BrowseScreen(Screen):
         self.page_offset = 0
         self.run_search()
 
+    def _database_chosen(self, path: str | None) -> None:
+        if path:
+            self.query_one("#db_path", Input).value = path
+            self.load_db()
+
     def _filters(self) -> dict:
         return parse_query(self.query_one("#query", Input).value.strip())
 
@@ -561,7 +635,9 @@ class BrowseScreen(Screen):
             self._search_timer = self.set_timer(0.2, self._run_live_search)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "query":
+        if event.input.id == "db_path":
+            self.load_db()
+        elif event.input.id == "query":
             if self._search_timer:
                 self._search_timer.stop()
                 self._search_timer = None
@@ -763,6 +839,34 @@ class RolodexApp(App):
     #elapsed { width: 8; content-align: right middle; color: $text-muted; }
     #confirm-panel { width: 60; align: center middle; }
     #confirm-panel Button { width: 1fr; margin: 1 1 0 0; }
+
+    DatabasePicker {
+        align: center middle;
+        background: $background 70%;
+    }
+    #db-picker {
+        width: 90%;
+        max-width: 100;
+        height: 95%;
+        padding: 0 2 1 2;
+        border: round $accent;
+        background: $panel;
+    }
+    #picker-directory {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+    }
+    #db-picker > .title { height: 1; padding: 0 1; }
+    #picker-tree {
+        height: 1fr;
+        margin: 0;
+        border: round $primary-muted;
+        background: $boost;
+    }
+    #db-picker Label { color: $text-muted; padding: 0 1; }
+    #picker-actions { height: 3; }
+    #picker-actions Button { width: 1fr; margin-right: 1; }
 
     .toolbar {
         height: 3;
