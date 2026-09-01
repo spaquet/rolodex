@@ -8,6 +8,7 @@ import time
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
+from textual.timer import Timer
 from textual.widgets import (
     Button,
     Checkbox,
@@ -209,22 +210,11 @@ class FolderScreen(Screen):
             (folder for folder in self.folders if "\\all" in folder.flags.lower().split()),
             None,
         )
-        yield Static(
-            "Select folders to scan. A server-designated All Mail folder is selected alone "
-            "for speed; otherwise spam/trash-like folders are pre-unchecked.",
-            classes="title",
-        )
-        yield Label("Output sqlite/libsql file path")
-        yield Static(
-            "Contacts and extraction checkpoints are stored here; use a different file per mailbox.",
-            classes="hint",
-        )
         db_default = (
             self.cfg["db_path"]
             if self.cfg["db_path"] not in ("", "contacts.db", "test.db")
             else self.suggested_db
         )
-        yield Input(value=db_default, id="db_path")
         selections = [
             Selection(
                 folder.name,
@@ -233,8 +223,16 @@ class FolderScreen(Screen):
             )
             for folder in self.folders
         ]
-        yield SelectionList[str](*selections, id="folders")
-        yield Button("Continue", id="continue", variant="primary")
+        with Vertical(id="folder-panel", classes="workspace"):
+            yield Static("Choose folders", classes="title")
+            yield Static(
+                "All Mail is preselected alone for speed; junk-like folders start unchecked.",
+                classes="hint",
+            )
+            yield Label("Output database · use one file per mailbox")
+            yield Input(value=db_default, id="db_path")
+            yield SelectionList[str](*selections, id="folders")
+            yield Button("Continue", id="continue", variant="primary")
         yield Footer()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -282,13 +280,15 @@ class DomainScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static("Excluded domains (contacts from these are skipped)", classes="title")
-        with Horizontal(id="add-row"):
-            yield Input(placeholder="example.com", id="new_domain")
-            yield Button("Add", id="add_domain")
-        yield ListView(*[ListItem(Label(d)) for d in self.domains], id="domain_list")
-        yield Static("Select a row + press 'd' to remove.", classes="hint")
-        yield Button("Start scan", id="continue", variant="primary")
+        with Vertical(id="domain-panel", classes="workspace"):
+            yield Static("Excluded domains", classes="title")
+            yield Static("Contacts from these domains are skipped.", classes="hint")
+            with Horizontal(id="add-row"):
+                yield Input(placeholder="example.com", id="new_domain")
+                yield Button("Add", id="add_domain")
+            yield ListView(*[ListItem(Label(d)) for d in self.domains], id="domain_list")
+            yield Static("Select a row and press d to remove it.", classes="hint")
+            yield Button("Start scan", id="continue", variant="primary")
         yield Footer()
 
     def action_remove_selected(self) -> None:
@@ -492,19 +492,19 @@ class BrowseScreen(Screen):
         self.page_offset = 0
         self.total = 0
         self._suggest_prefix = ""
+        self._search_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield Static("Contacts  ·  results update as you type", classes="title")
         with Horizontal(id="db-row", classes="toolbar"):
             yield Input(value=self.cfg["db_path"], placeholder="contacts.db", id="db_path")
             yield Button("Load", id="load", variant="primary")
         with Vertical(id="search-wrap"):
-            with Horizontal(classes="toolbar"):
-                yield Input(
-                    placeholder="Search contacts…  try folder: after: before:",
-                    id="query",
-                )
-                yield Button("Search", id="search_btn", variant="primary")
+            yield Input(
+                placeholder="Search names or emails…  try folder: after: before:",
+                id="query",
+            )
             yield OptionList(id="suggestions")
         yield DataTable(id="table", zebra_stripes=True, cursor_type="row")
         with Horizontal(id="page-row", classes="toolbar"):
@@ -527,10 +527,6 @@ class BrowseScreen(Screen):
         button_id = event.button.id
         if button_id == "load":
             self.load_db()
-        elif button_id == "search_btn":
-            self.query_one("#suggestions", OptionList).display = False
-            self.page_offset = 0
-            self.run_search()
         elif button_id == "prev":
             self.page_offset = max(0, self.page_offset - PAGE_SIZE)
             self.run_search()
@@ -560,12 +556,23 @@ class BrowseScreen(Screen):
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "query":
             self._update_suggestions(event.value)
+            if self._search_timer:
+                self._search_timer.stop()
+            self._search_timer = self.set_timer(0.2, self._run_live_search)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "query":
+            if self._search_timer:
+                self._search_timer.stop()
+                self._search_timer = None
             self.query_one("#suggestions", OptionList).display = False
             self.page_offset = 0
             self.run_search()
+
+    def _run_live_search(self) -> None:
+        self._search_timer = None
+        self.page_offset = 0
+        self.run_search()
 
     def _update_suggestions(self, value: str) -> None:
         """Gmail-style operator/value suggestions for the last word being typed."""
@@ -643,19 +650,23 @@ class RolodexApp(App):
         background: $surface;
     }
     RunScreen, BrowseScreen, FolderScreen, DomainScreen {
-        align: left top;
+        align: center top;
         background: $surface;
     }
-
-    .title {
-        padding: 1 2 0 2;
-        text-style: none;
+    Header {
+        background: $primary;
         color: $text;
     }
+    Footer { background: $panel; }
+
+    .title {
+        padding: 1 1 0 1;
+        text-style: bold;
+        color: $accent;
+    }
     .hint {
-        padding: 0 2 1 2;
+        padding: 0 1 1 1;
         color: $text-muted;
-        text-style: italic;
     }
 
     .panel {
@@ -667,7 +678,8 @@ class RolodexApp(App):
     #start-panel {
         width: 46;
         align: center middle;
-        border: round $primary-muted;
+        border: round $accent;
+        padding: 2 4;
     }
     #start-panel .title {
         text-align: center;
@@ -681,8 +693,28 @@ class RolodexApp(App):
         border: none;
     }
 
-    #form { padding: 1 3; }
+    #form {
+        width: 64;
+        padding: 1 3;
+        border: round $accent;
+    }
     #form Label { color: $text-muted; padding: 1 0 0 0; }
+
+    .workspace {
+        width: 1fr;
+        max-width: 110;
+        height: 1fr;
+        margin: 1 2;
+        padding: 0 2 1 2;
+        border: round $primary-muted;
+        background: $panel;
+    }
+    .workspace Label {
+        color: $text-muted;
+        padding: 0 1;
+    }
+    .workspace > .title { height: 1; padding: 0 1; }
+    .workspace .hint { padding: 0 1; }
 
     Input {
         border: round $primary-muted;
@@ -695,19 +727,25 @@ class RolodexApp(App):
     Button {
         border: none;
         min-width: 12;
+        height: 3;
     }
 
     SelectionList {
         border: round $primary-muted;
-        background: $panel;
+        background: $boost;
         margin: 1 0;
+    }
+    #folder-panel SelectionList { height: 1fr; margin: 0; }
+    #folder-panel > Button, #domain-panel > Button {
+        width: 100%;
+        margin-top: 1;
     }
 
     #add-row { height: 3; padding: 0 0 1 0; }
     #new_domain { width: 1fr; margin-right: 1; }
     ListView {
         border: round $primary-muted;
-        background: $panel;
+        background: $boost;
         height: auto;
         max-height: 12;
         margin: 0 0 1 0;
@@ -718,7 +756,7 @@ class RolodexApp(App):
         border: round $primary-muted;
         margin: 0 2 1 2;
     }
-    #log { background: $panel; }
+    #log { background: $boost; }
     #folder_status { padding: 1 2; }
     #progress-row { height: 1; margin: 0 2 1 2; }
     #progress-row ProgressBar { width: 1fr; }
@@ -726,26 +764,38 @@ class RolodexApp(App):
     #confirm-panel { width: 60; align: center middle; }
     #confirm-panel Button { width: 1fr; margin: 1 1 0 0; }
 
-    .toolbar { height: 3; padding: 0 1; margin-bottom: 1; }
+    .toolbar {
+        height: 3;
+        padding: 0 1;
+        margin: 0 1;
+        background: $panel;
+    }
     .toolbar Input { width: 1fr; margin-right: 1; }
 
-    #search-wrap { padding: 0 1; height: auto; }
+    #search-wrap {
+        padding: 0 1;
+        margin: 0 1;
+        height: auto;
+        background: $panel;
+    }
     #suggestions {
         border: round $accent;
-        background: $panel;
+        background: $boost;
         height: auto;
         max-height: 8;
-        margin: 0 1 1 1;
+        margin-top: 1;
     }
 
     #table {
         height: 1fr;
         margin: 0 1;
         border: round $primary-muted;
-        background: $panel;
+        background: $boost;
     }
+    BrowseScreen > .title { height: 1; padding: 0 2; }
+    #page-row { border: none; background: $surface; }
     #page_info { width: 1fr; content-align: center middle; color: $text-muted; }
-    #browse_status { padding: 0 2 1 2; color: $text-muted; }
+    #browse_status { height: 1; padding: 0 2; color: $text-muted; }
     """
 
     def get_system_commands(self, screen: Screen):
