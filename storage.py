@@ -101,6 +101,21 @@ class ContactStore:
         if signature and (not previous or (date and (not previous[1] or date >= previous[1]))):
             self._signatures[email] = (signature, date)
 
+    def record_signature(self, email: str, signature: str, date: str = ""):
+        """Register an extracted signature for an address without touching
+        its message_count/folders/first_seen/last_seen (record() owns those).
+
+        Used when signature extraction is deferred to a second pass over a
+        subset of messages (e.g. only the newest per sender), separate from
+        the header-only pass that drives record().
+        """
+        email = email.lower().strip()
+        if not email or not signature:
+            return
+        previous = self._signatures.get(email)
+        if not previous or (date and (not previous[1] or date >= previous[1])):
+            self._signatures[email] = (signature, date)
+
     def checkpoint(self, host: str, username: str, folder: str) -> tuple[str, int] | None:
         """Return the saved (UIDVALIDITY, last UID) for one account folder."""
         return self._conn.execute(

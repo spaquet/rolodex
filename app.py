@@ -378,7 +378,7 @@ class RunScreen(Screen):
             yield ProgressBar(id="progress", total=100, show_eta=False)
             yield Static("00:00", id="elapsed")
         with VerticalScroll(id="log-wrap"):
-            yield RichLog(id="log", wrap=True, highlight=True)
+            yield RichLog(id="log", wrap=True, highlight=True, markup=True)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -463,34 +463,60 @@ class RunScreen(Screen):
             self.append_log(f"{folder}: {len(uids)} new messages")
             self.app.call_from_thread(progress.update, total=len(uids) or 1, progress=0)
             done = 0
+            newest_uid_by_sender: dict[str, tuple[bytes, str]] = {}
             try:
-                for batch, messages in im.fetch_message_batches(self.conn, uids):
-                    for raw_message in messages:
+                for batch, headers_list in im.fetch_header_batches(self.conn, uids):
+                    for uid, raw_headers in zip(batch, headers_list):
                         try:
-                            addresses, date, sender, body, subtype = im.parse_message(raw_message)
-                            found_signature = im.extract_signature(body, subtype, sender)
+                            addresses = im.parse_addresses(raw_headers)
+                            date = im.parse_date(raw_headers)
+                            sender = im.parse_sender(raw_headers)
                         except Exception as e:
-                            self.append_log(f"[yellow]{folder}: skipped unparseable message: {e}[/yellow]")
+                            self.append_log(
+                                f"[yellow]{folder} UID {uid.decode()}: skipped unparseable headers: {e}[/yellow]"
+                            )
                             continue
                         for name, addr in addresses:
                             domain = addr.split("@")[-1].lower() if "@" in addr else ""
                             if domain in self.excluded_domains:
                                 continue
-                            store.record(
-                                addr,
-                                name,
-                                folder,
-                                date,
-                                found_signature if addr.lower() == sender.lower() else "",
-                            )
+                            store.record(addr, name, folder, date)
+                        sender_l = sender.lower()
+                        sender_domain = sender_l.split("@")[-1] if "@" in sender_l else ""
+                        if sender_l and sender_domain not in self.excluded_domains:
+                            prev = newest_uid_by_sender.get(sender_l)
+                            if not prev or (date and (not prev[1] or date >= prev[1])):
+                                newest_uid_by_sender[sender_l] = (uid, date)
                     done += len(batch)
                     self.app.call_from_thread(progress.update, progress=done)
             except im.ImapError as e:
                 store.discard()
                 self.append_log(f"[red]Skip {folder}: {e}[/red]")
                 continue
-
             self.app.call_from_thread(progress.update, progress=len(uids) or 1)
+
+            sig_uids = [uid for uid, _ in newest_uid_by_sender.values()]
+            if sig_uids:
+                self.append_log(f"{folder}: extracting signatures for {len(sig_uids)} senders")
+                self.app.call_from_thread(progress.update, total=len(sig_uids), progress=0)
+                done = 0
+                try:
+                    for batch, messages in im.fetch_message_batches(self.conn, sig_uids):
+                        for uid, raw_message in zip(batch, messages):
+                            try:
+                                _, date, sender, body, subtype = im.parse_message(raw_message)
+                                found_signature = im.extract_signature(body, subtype, sender)
+                            except Exception as e:
+                                self.append_log(
+                                    f"[yellow]{folder} UID {uid.decode()}: signature extraction failed: {e}[/yellow]"
+                                )
+                                continue
+                            if found_signature:
+                                store.record_signature(sender, found_signature, date)
+                        done += len(batch)
+                        self.app.call_from_thread(progress.update, progress=done)
+                except im.ImapError as e:
+                    self.append_log(f"[red]{folder}: signature extraction pass failed: {e}[/red]")
             newest_uid = int(uids[-1]) if uids else last_uid
             store.flush((self.host, self.username, folder, uidvalidity, newest_uid))
 

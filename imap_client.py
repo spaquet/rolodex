@@ -236,19 +236,8 @@ def extract_signature(body: str, subtype: str, sender: str) -> str:
     return found.strip() if found else ""
 
 
-def parse_addresses(raw_headers: str) -> list[tuple[str, str]]:
-    """Extract every (display_name, email) pair from From/To/Cc header text.
-
-    Handles folded (multi-line, indented) headers and RFC 2047 encoded
-    display names, and splits comma-separated address lists within a
-    single header.
-
-    Args:
-        raw_headers: Raw header block returned by fetch_header_batches().
-
-    Returns:
-        (name, email) pairs, one per address found. name may be "".
-    """
+def _split_header_lines(raw_headers: str) -> dict[str, list[str]]:
+    """Split raw From/To/Cc header text into unfolded per-header line lists."""
     lines = {"from": [], "to": [], "cc": []}
     current_key = None
     buf = []
@@ -265,7 +254,23 @@ def parse_addresses(raw_headers: str) -> list[tuple[str, str]]:
             buf.append(line.strip())
     if current_key and buf:
         lines[current_key].append(" ".join(buf))
+    return lines
 
+
+def parse_addresses(raw_headers: str) -> list[tuple[str, str]]:
+    """Extract every (display_name, email) pair from From/To/Cc header text.
+
+    Handles folded (multi-line, indented) headers and RFC 2047 encoded
+    display names, and splits comma-separated address lists within a
+    single header.
+
+    Args:
+        raw_headers: Raw header block returned by fetch_header_batches().
+
+    Returns:
+        (name, email) pairs, one per address found. name may be "".
+    """
+    lines = _split_header_lines(raw_headers)
     results = []
     for key in ("from", "to", "cc"):
         for entry in lines[key]:
@@ -274,6 +279,15 @@ def parse_addresses(raw_headers: str) -> list[tuple[str, str]]:
                 if addr:
                     results.append((name.strip(), addr.strip()))
     return results
+
+
+def parse_sender(raw_headers: str) -> str:
+    """Extract the first From address from raw header text, or "" if absent."""
+    for entry in _split_header_lines(raw_headers)["from"]:
+        addrs = getaddresses([_decode(entry)])
+        if addrs and addrs[0][1]:
+            return addrs[0][1].strip()
+    return ""
 
 
 def parse_date(raw_headers: str) -> str:
