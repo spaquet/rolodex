@@ -5,13 +5,14 @@ TUI to scan your IMAP mailbox and extract every name + email address you've corr
 ## Setup
 
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 ```
 
 ## Run
 
 ```bash
-python app.py
+.venv/bin/python app.py
 ```
 
 ## Flow
