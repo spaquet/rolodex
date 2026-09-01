@@ -18,6 +18,17 @@ CREATE TABLE IF NOT EXISTS contacts (
 );
 """
 
+STATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS extraction_state (
+    host TEXT NOT NULL,
+    username TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    uidvalidity TEXT NOT NULL,
+    last_uid INTEGER NOT NULL,
+    PRIMARY KEY (host, username, folder)
+);
+"""
+
 
 class ContactStore:
     """Accumulates (email, name, folder, date) observations in memory and
@@ -37,6 +48,7 @@ class ContactStore:
         self._conn = sqlite3.connect(db_path)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(SCHEMA)
+        self._conn.execute(STATE_SCHEMA)
         self._conn.commit()
         # per-email tally of {display_name: occurrence_count}, used to pick
         # the most-frequent name for that address at flush() time
@@ -71,12 +83,25 @@ class ContactStore:
             if email not in self._last_seen or date > self._last_seen[email]:
                 self._last_seen[email] = date
 
-    def flush(self):
+    def checkpoint(self, host: str, username: str, folder: str) -> tuple[str, int] | None:
+        """Return the saved (UIDVALIDITY, last UID) for one account folder."""
+        return self._conn.execute(
+            """
+            SELECT uidvalidity, last_uid FROM extraction_state
+            WHERE host = ? AND username = ? AND folder = ?
+            """,
+            (host, username, folder),
+        ).fetchone()
+
+    def flush(self, checkpoint: tuple[str, str, str, str, int] | None = None):
         """Write all buffered observations to the `contacts` table.
 
         Safe to call multiple times (e.g. once per folder): each call
         upserts on `email`, adding to message_count and expanding the
         `folders` list for addresses seen before.
+
+        When supplied, the extraction checkpoint is committed atomically
+        with the contacts so an interrupted retry cannot double-count them.
         """
         with closing(self._conn.cursor()) as cur:
             for email, count in self._msg_count.items():
@@ -103,12 +128,27 @@ class ContactStore:
                         self._last_seen.get(email, ""),
                     ),
                 )
+            if checkpoint:
+                cur.execute(
+                    """
+                    INSERT INTO extraction_state (host, username, folder, uidvalidity, last_uid)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(host, username, folder) DO UPDATE SET
+                        uidvalidity = excluded.uidvalidity,
+                        last_uid = excluded.last_uid
+                    """,
+                    checkpoint,
+                )
         self._conn.commit()
-        self._name_counts = defaultdict(lambda: defaultdict(int))
-        self._msg_count = defaultdict(int)
-        self._folders = defaultdict(set)
-        self._first_seen = {}
-        self._last_seen = {}
+        self.discard()
+
+    def discard(self):
+        """Discard observations buffered since the last successful flush."""
+        self._name_counts.clear()
+        self._msg_count.clear()
+        self._folders.clear()
+        self._first_seen.clear()
+        self._last_seen.clear()
 
     def close(self):
         """Close the underlying sqlite connection."""

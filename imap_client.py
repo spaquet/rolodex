@@ -6,6 +6,7 @@ from email.header import decode_header
 from email.utils import getaddresses, parsedate_to_datetime
 
 SKIP_HINTS = ("spam", "junk", "trash", "bin", "deleted")
+FETCH_BATCH_SIZE = 1000
 
 FOLDER_LINE_RE = re.compile(r'\((?P<flags>[^)]*)\)\s+"(?P<delim>[^"]*)"\s+(?P<name>.+)')
 
@@ -29,7 +30,7 @@ class Folder:
 
 
 class ImapError(Exception):
-    """Raised for any IMAP failure (connect, login, LIST/SELECT/SEARCH)."""
+    """Raised for any IMAP failure (connect, login, LIST/SELECT/SEARCH/FETCH)."""
 
 
 def connect(host: str, port: int, username: str, password: str, use_ssl: bool) -> imaplib.IMAP4:
@@ -111,52 +112,66 @@ def _decode(value: str) -> str:
     return "".join(out)
 
 
-def search_all(conn: imaplib.IMAP4, folder: str) -> list[bytes]:
-    """Select a folder read-only and return every message id in it.
+def select_folder(conn: imaplib.IMAP4, folder: str) -> str:
+    """Select a folder read-only and return its UIDVALIDITY value.
 
     Args:
         conn: An authenticated IMAP connection.
         folder: Folder name to select, exactly as returned by list_folders().
 
-    Returns:
-        Message ids (as returned by IMAP SEARCH), in server order.
-
     Raises:
-        ImapError: If SELECT or SEARCH fails (e.g. folder doesn't exist).
+        ImapError: If SELECT fails or the server omits UIDVALIDITY.
     """
     status, _ = conn.select(f'"{folder}"', readonly=True)
     if status != "OK":
         raise ImapError(f"SELECT failed for {folder}")
-    status, data = conn.search(None, "ALL")
+    _, data = conn.response("UIDVALIDITY")
+    if not data or not data[0]:
+        raise ImapError(f"UIDVALIDITY missing for {folder}")
+    value = data[0]
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
+def search_uids(conn: imaplib.IMAP4, after_uid: int = 0) -> list[bytes]:
+    """Return message UIDs newer than after_uid in the selected folder."""
+    criteria = ("ALL",) if not after_uid else ("UID", f"{after_uid + 1}:*")
+    status, data = conn.uid("search", None, *criteria)
     if status != "OK":
-        raise ImapError(f"SEARCH failed for {folder}")
-    ids = data[0].split()
-    return ids
+        raise ImapError("UID SEARCH failed")
+    # IMAP ranges reverse when their start exceeds *, so filter the last UID
+    # that some servers return when the mailbox has no newer messages.
+    return sorted((uid for uid in data[0].split() if int(uid) > after_uid), key=int)
 
 
-def fetch_headers(conn: imaplib.IMAP4, msg_ids: list[bytes], batch_size: int = 200):
-    """Fetch From/To/Cc/Date headers for a set of messages, in batches.
+def fetch_header_batches(
+    conn: imaplib.IMAP4, msg_uids: list[bytes], batch_size: int = FETCH_BATCH_SIZE
+):
+    """Fetch From/To/Cc/Date headers for message UIDs, yielding completed batches.
 
     Uses BODY.PEEK so messages are not marked \\Seen. The currently
-    selected folder (from search_all) is used implicitly.
+    selected folder (from select_folder) is used implicitly.
 
     Args:
-        msg_ids: Message ids to fetch, as returned by search_all().
+        msg_uids: Message UIDs to fetch, as returned by search_uids().
         batch_size: Messages per FETCH command, to keep individual
             IMAP responses a manageable size.
 
     Yields:
-        Raw header text (From/To/Cc/Date lines) for each fetched message.
+        (requested UIDs, raw header texts) for each completed batch.
     """
-    for i in range(0, len(msg_ids), batch_size):
-        batch = msg_ids[i : i + batch_size]
+    for i in range(0, len(msg_uids), batch_size):
+        batch = msg_uids[i : i + batch_size]
         id_set = b",".join(batch)
-        status, data = conn.fetch(id_set, "(BODY.PEEK[HEADER.FIELDS (FROM TO CC DATE)])")
+        status, data = conn.uid(
+            "fetch", id_set, "(BODY.PEEK[HEADER.FIELDS (FROM TO CC DATE)])"
+        )
         if status != "OK":
-            continue
-        for part in data:
-            if isinstance(part, tuple) and len(part) > 1:
-                yield part[1].decode(errors="replace")
+            raise ImapError("UID FETCH failed")
+        yield batch, [
+            part[1].decode(errors="replace")
+            for part in data
+            if isinstance(part, tuple) and len(part) > 1
+        ]
 
 
 def parse_addresses(raw_headers: str) -> list[tuple[str, str]]:
@@ -167,7 +182,7 @@ def parse_addresses(raw_headers: str) -> list[tuple[str, str]]:
     single header.
 
     Args:
-        raw_headers: Raw header block as returned by fetch_headers().
+        raw_headers: Raw header block returned by fetch_header_batches().
 
     Returns:
         (name, email) pairs, one per address found. name may be "".
@@ -203,7 +218,7 @@ def parse_date(raw_headers: str) -> str:
     """Extract and normalize the message Date header.
 
     Args:
-        raw_headers: Raw header block as returned by fetch_headers().
+        raw_headers: Raw header block returned by fetch_header_batches().
 
     Returns:
         ISO-8601 timestamp, or "" if no Date header is present or it

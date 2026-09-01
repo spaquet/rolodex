@@ -203,12 +203,22 @@ class FolderScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header()
+        all_folder = next(
+            (folder for folder in self.folders if "\\all" in folder.flags.lower().split()),
+            None,
+        )
         yield Static(
-            "Select folders to scan (spam/trash-like folders pre-unchecked). Space to toggle.",
+            "Select folders to scan. A server-designated All Mail folder is selected alone "
+            "for speed; otherwise spam/trash-like folders are pre-unchecked.",
             classes="title",
         )
         selections = [
-            Selection(f.name, f.name, not f.looks_excludable) for f in self.folders
+            Selection(
+                folder.name,
+                folder.name,
+                folder is all_folder if all_folder else not folder.looks_excludable,
+            )
+            for folder in self.folders
         ]
         yield SelectionList[str](*selections, id="folders")
         yield Button("Continue", id="continue", variant="primary")
@@ -235,6 +245,8 @@ class DomainScreen(Screen):
         super().__init__()
         self.conn = conn
         self.folders = folders
+        self.username = username
+        self.host = host
         self.cfg = cfgmod.load()
         self.domains = list(self.cfg["excluded_domains"])
         self.suggested_db = default_db_name(username, host)
@@ -278,7 +290,16 @@ class DomainScreen(Screen):
         elif event.button.id == "continue":
             db_path = self.query_one("#db_path", Input).value.strip() or self.cfg["db_path"]
             cfgmod.save({**self.cfg, "excluded_domains": self.domains, "db_path": db_path})
-            self.app.push_screen(RunScreen(self.conn, self.folders, self.domains, db_path))
+            self.app.push_screen(
+                RunScreen(
+                    self.conn,
+                    self.folders,
+                    self.domains,
+                    db_path,
+                    self.host,
+                    self.username,
+                )
+            )
 
 
 class ConfirmQuitScreen(ModalScreen[bool]):
@@ -307,12 +328,22 @@ class RunScreen(Screen):
 
     BINDINGS = [("q", "try_quit", "Quit"), ("b", "browse", "Browse (bg)")]
 
-    def __init__(self, conn: imaplib.IMAP4, folders: list[str], excluded_domains: list[str], db_path: str):
+    def __init__(
+        self,
+        conn: imaplib.IMAP4,
+        folders: list[str],
+        excluded_domains: list[str],
+        db_path: str,
+        host: str,
+        username: str,
+    ):
         super().__init__()
         self.conn = conn
         self.folders = folders
         self.excluded_domains = set(excluded_domains)
         self.db_path = db_path
+        self.host = host
+        self.username = username
         self.done = False
         self.start_time = time.monotonic()
 
@@ -370,26 +401,48 @@ class RunScreen(Screen):
         for fi, folder in enumerate(self.folders, start=1):
             self.app.call_from_thread(status.update, f"[{fi}/{total_folders}] Scanning: {folder}")
             try:
-                ids = im.search_all(self.conn, folder)
+                uidvalidity = im.select_folder(self.conn, folder)
             except im.ImapError as e:
                 self.append_log(f"[red]Skip {folder}: {e}[/red]")
                 continue
 
-            self.append_log(f"{folder}: {len(ids)} messages")
-            self.app.call_from_thread(progress.update, total=len(ids) or 1, progress=0)
-            done = 0
-            for raw_headers in im.fetch_headers(self.conn, ids):
-                date = im.parse_date(raw_headers)
-                for name, addr in im.parse_addresses(raw_headers):
-                    domain = addr.split("@")[-1].lower() if "@" in addr else ""
-                    if domain in self.excluded_domains:
-                        continue
-                    store.record(addr, name, folder, date)
-                done += 1
-                if done % 25 == 0 or done == len(ids):
-                    self.app.call_from_thread(progress.update, progress=done)
+            checkpoint = store.checkpoint(self.host, self.username, folder)
+            if checkpoint and checkpoint[0] != uidvalidity:
+                self.append_log(
+                    f"[red]Skip {folder}: UIDVALIDITY changed; use a fresh database "
+                    "to avoid double-counting.[/red]"
+                )
+                continue
 
-            store.flush()
+            last_uid = checkpoint[1] if checkpoint else 0
+            try:
+                uids = im.search_uids(self.conn, last_uid)
+            except im.ImapError as e:
+                self.append_log(f"[red]Skip {folder}: {e}[/red]")
+                continue
+
+            self.append_log(f"{folder}: {len(uids)} new messages")
+            self.app.call_from_thread(progress.update, total=len(uids) or 1, progress=0)
+            done = 0
+            try:
+                for batch, headers in im.fetch_header_batches(self.conn, uids):
+                    for raw_headers in headers:
+                        date = im.parse_date(raw_headers)
+                        for name, addr in im.parse_addresses(raw_headers):
+                            domain = addr.split("@")[-1].lower() if "@" in addr else ""
+                            if domain in self.excluded_domains:
+                                continue
+                            store.record(addr, name, folder, date)
+                    done += len(batch)
+                    self.app.call_from_thread(progress.update, progress=done)
+            except im.ImapError as e:
+                store.discard()
+                self.append_log(f"[red]Skip {folder}: {e}[/red]")
+                continue
+
+            self.app.call_from_thread(progress.update, progress=len(uids) or 1)
+            newest_uid = int(uids[-1]) if uids else last_uid
+            store.flush((self.host, self.username, folder, uidvalidity, newest_uid))
 
         count = store.contact_count
         store.close()
