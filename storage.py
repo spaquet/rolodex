@@ -35,6 +35,7 @@ class ContactStore:
         """
         self.db_path = db_path
         self._conn = sqlite3.connect(db_path)
+        self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(SCHEMA)
         self._conn.commit()
         # per-email tally of {display_name: occurrence_count}, used to pick
@@ -103,6 +104,11 @@ class ContactStore:
                     ),
                 )
         self._conn.commit()
+        self._name_counts = defaultdict(lambda: defaultdict(int))
+        self._msg_count = defaultdict(int)
+        self._folders = defaultdict(set)
+        self._first_seen = {}
+        self._last_seen = {}
 
     def close(self):
         """Close the underlying sqlite connection."""
@@ -110,8 +116,8 @@ class ContactStore:
 
     @property
     def contact_count(self) -> int:
-        """Number of distinct email addresses recorded so far."""
-        return len(self._msg_count)
+        """Number of distinct email addresses written to the db so far (flushed rows)."""
+        return self._conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
 
     def distinct_folders(self) -> list[str]:
         """All distinct folder names present across stored contacts, sorted."""

@@ -11,7 +11,7 @@ DEFAULTS = {
     "last_port": 993,
     "last_username": "",
     "last_use_ssl": True,
-    "db_path": str(Path.cwd() / "contacts.db"),
+    "db_path": "",
 }
 
 

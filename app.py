@@ -1,11 +1,13 @@
 """Rolodex: TUI to connect to any IMAP server, pick folders, filter domains,
 and extract contacts to sqlite."""
 import imaplib
+import re
 import threading
+import time
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import Screen
+from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
     Checkbox,
@@ -31,6 +33,23 @@ from storage import ContactStore
 
 PAGE_SIZE = 50
 SEARCH_OPERATORS = ["folder:", "after:", "before:"]
+
+
+def default_db_name(username: str, host: str) -> str:
+    """Suggest a per-account db filename, e.g. alice_imap.example.com.db.
+
+    Keeps contacts from different mailboxes in separate files by default,
+    since the `contacts` table dedupes globally on email address.
+    """
+    local = username.split("@")[0]
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{local}_{host}").strip("_")
+    return f"{slug}.db"
+
+
+def format_elapsed(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
 def parse_query(text: str) -> dict:
@@ -163,7 +182,7 @@ class ConnectScreen(Screen):
                 "last_use_ssl": use_ssl,
             }
         )
-        self.app.push_screen(FolderScreen(conn, folders))
+        self.app.push_screen(FolderScreen(conn, folders, username, host))
 
 
 class FolderScreen(Screen):
@@ -175,10 +194,12 @@ class FolderScreen(Screen):
 
     BINDINGS = [("escape", "app.pop_screen", "Back")]
 
-    def __init__(self, conn: imaplib.IMAP4, folders: list[im.Folder]):
+    def __init__(self, conn: imaplib.IMAP4, folders: list[im.Folder], username: str, host: str):
         super().__init__()
         self.conn = conn
         self.folders = folders
+        self.username = username
+        self.host = host
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -198,7 +219,7 @@ class FolderScreen(Screen):
             selected = self.query_one("#folders", SelectionList).selected
             if not selected:
                 return
-            self.app.push_screen(DomainScreen(self.conn, list(selected)))
+            self.app.push_screen(DomainScreen(self.conn, list(selected), self.username, self.host))
 
 
 class DomainScreen(Screen):
@@ -210,12 +231,13 @@ class DomainScreen(Screen):
 
     BINDINGS = [("escape", "app.pop_screen", "Back"), ("d", "remove_selected", "Remove domain")]
 
-    def __init__(self, conn: imaplib.IMAP4, folders: list[str]):
+    def __init__(self, conn: imaplib.IMAP4, folders: list[str], username: str, host: str):
         super().__init__()
         self.conn = conn
         self.folders = folders
         self.cfg = cfgmod.load()
         self.domains = list(self.cfg["excluded_domains"])
+        self.suggested_db = default_db_name(username, host)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -226,7 +248,13 @@ class DomainScreen(Screen):
         yield ListView(*[ListItem(Label(d)) for d in self.domains], id="domain_list")
         yield Static("Select a row + press 'd' to remove.", classes="hint")
         yield Label("Output sqlite/libsql file path")
-        yield Input(value=self.cfg["db_path"], id="db_path")
+        yield Static(
+            "Different mailboxes should usually use different db files "
+            "(contacts dedupe globally by email address within one file).",
+            classes="hint",
+        )
+        db_default = self.cfg["db_path"] if self.cfg["db_path"] not in ("", "contacts.db", "test.db") else self.suggested_db
+        yield Input(value=db_default, id="db_path")
         yield Button("Start scan", id="continue", variant="primary")
         yield Footer()
 
@@ -253,14 +281,31 @@ class DomainScreen(Screen):
             self.app.push_screen(RunScreen(self.conn, self.folders, self.domains, db_path))
 
 
+class ConfirmQuitScreen(ModalScreen[bool]):
+    """Modal asking to confirm abandoning an in-progress extraction."""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-panel", classes="panel"):
+            yield Static("Extraction is still running.", classes="title")
+            yield Static("Contacts saved so far stay in the db. Quit anyway?", classes="hint")
+            with Horizontal():
+                yield Button("Quit", id="yes", variant="error")
+                yield Button("Cancel", id="no", variant="primary")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "yes")
+
+
 class RunScreen(Screen):
     """Final screen: runs the extraction and shows live progress.
 
     Extraction runs on a background thread; all widget updates are
-    marshalled back to the UI thread via `app.call_from_thread`.
+    marshalled back to the UI thread via `app.call_from_thread`. The thread
+    keeps running even if this screen is covered by another (e.g. Browse),
+    so results already flushed to the db can be searched mid-run.
     """
 
-    BINDINGS = [("q", "app.quit", "Quit")]
+    BINDINGS = [("q", "try_quit", "Quit"), ("b", "browse", "Browse (bg)")]
 
     def __init__(self, conn: imaplib.IMAP4, folders: list[str], excluded_domains: list[str], db_path: str):
         super().__init__()
@@ -268,11 +313,15 @@ class RunScreen(Screen):
         self.folders = folders
         self.excluded_domains = set(excluded_domains)
         self.db_path = db_path
+        self.done = False
+        self.start_time = time.monotonic()
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("", id="folder_status", classes="title")
-        yield ProgressBar(id="progress", total=100)
+        with Horizontal(id="progress-row"):
+            yield ProgressBar(id="progress", total=100, show_eta=False)
+            yield Static("00:00", id="elapsed")
         with VerticalScroll(id="log-wrap"):
             yield RichLog(id="log", wrap=True, highlight=True)
         yield Footer()
@@ -280,6 +329,26 @@ class RunScreen(Screen):
     def on_mount(self) -> None:
         """Kick off extraction as soon as this screen is shown."""
         threading.Thread(target=self.run_extraction, daemon=True).start()
+        self.set_interval(1, self._tick_elapsed)
+
+    def _tick_elapsed(self) -> None:
+        if not self.done:
+            self.query_one("#elapsed", Static).update(format_elapsed(time.monotonic() - self.start_time))
+
+    def action_try_quit(self) -> None:
+        if self.done:
+            self.app.exit()
+            return
+
+        def check(quit_anyway: bool | None) -> None:
+            if quit_anyway:
+                self.app.exit()
+
+        self.app.push_screen(ConfirmQuitScreen(), check)
+
+    def action_browse(self) -> None:
+        """Open the contacts browser on top of this screen without stopping extraction."""
+        self.app.push_screen(BrowseScreen())
 
     def append_log(self, msg: str) -> None:
         """Append a line to the on-screen log (thread-safe)."""
@@ -289,7 +358,9 @@ class RunScreen(Screen):
         """Worker: scan each selected folder, extract contacts, write to storage.
 
         Runs entirely off the UI thread; progress and log updates are
-        marshalled back via `app.call_from_thread`.
+        marshalled back via `app.call_from_thread`. Flushes after each
+        folder so a crash mid-run only loses the folder in progress, not
+        everything scanned so far.
         """
         store = ContactStore(self.db_path)
         progress = self.query_one("#progress", ProgressBar)
@@ -318,9 +389,11 @@ class RunScreen(Screen):
                 if done % 25 == 0 or done == len(ids):
                     self.app.call_from_thread(progress.update, progress=done)
 
-        store.flush()
+            store.flush()
+
         count = store.contact_count
         store.close()
+        self.done = True
         try:
             self.conn.logout()
         except imaplib.IMAP4.error:
@@ -572,7 +645,11 @@ class RolodexApp(App):
     }
     #log { background: $panel; }
     #folder_status { padding: 1 2; }
-    ProgressBar { margin: 0 2 1 2; }
+    #progress-row { height: 1; margin: 0 2 1 2; }
+    #progress-row ProgressBar { width: 1fr; }
+    #elapsed { width: 8; content-align: right middle; color: $text-muted; }
+    #confirm-panel { width: 60; align: center middle; }
+    #confirm-panel Button { width: 1fr; margin: 1 1 0 0; }
 
     .toolbar { height: 3; padding: 0 1; margin-bottom: 1; }
     .toolbar Input { width: 1fr; margin-right: 1; }
