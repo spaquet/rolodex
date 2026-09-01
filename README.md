@@ -16,10 +16,16 @@ python app.py
 
 ## Flow
 
-1. **Connect** — enter IMAP host, port, username, password (any provider; nothing is saved to disk).
-2. **Folders** — pick which folders to scan. Folders that look like Spam/Trash/Junk/Bin are pre-unchecked but shown so you can override.
-3. **Domain filter** — add/remove domains to exclude (e.g. `noreply.github.com`); saved for next run. Set the output db file path here too.
-4. **Run** — live progress per folder + overall, then a summary of unique contacts written.
+Start screen offers two paths:
+
+- **Extract from IMAP**
+  1. **Connect** — enter IMAP host, port, username, password (any provider; nothing is saved to disk).
+  2. **Folders** — pick which folders to scan. Folders that look like Spam/Trash/Junk/Bin are pre-unchecked but shown so you can override.
+  3. **Domain filter** — add/remove domains to exclude (e.g. `noreply.github.com`); saved for next run. Set the output db file path here too.
+  4. **Run** — live progress per folder + overall, then a summary of unique contacts written.
+- **Browse contacts db** — open an existing output db, search by name/email, filter by date range or folder, page through results, and export the current filtered set to CSV.
+
+Change theme any time via the command palette (`ctrl+p`).
 
 ## Output
 

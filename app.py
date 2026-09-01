@@ -9,6 +9,7 @@ from textual.screen import Screen
 from textual.widgets import (
     Button,
     Checkbox,
+    DataTable,
     Footer,
     Header,
     Input,
@@ -25,6 +26,29 @@ from textual.widgets.selection_list import Selection
 import config as cfgmod
 import imap_client as im
 from storage import ContactStore
+
+PAGE_SIZE = 50
+
+
+class StartScreen(Screen):
+    """Entry screen: extract fresh contacts from IMAP, or browse an existing db."""
+
+    BINDINGS = [("escape", "app.quit", "Quit")]
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical(id="start-panel", classes="panel"):
+            yield Static("Rolodex", classes="title")
+            yield Static("Extract and browse email contacts.", classes="hint")
+            yield Button("Extract from IMAP", id="extract", variant="primary")
+            yield Button("Browse contacts db", id="browse")
+        yield Footer()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "extract":
+            self.app.push_screen(ConnectScreen())
+        elif event.button.id == "browse":
+            self.app.push_screen(BrowseScreen())
 
 
 class ConnectScreen(Screen):
@@ -43,7 +67,7 @@ class ConnectScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with Vertical(id="form"):
+        with Vertical(id="form", classes="panel"):
             yield Static("IMAP Connection", classes="title")
             yield Label("Host")
             yield Input(value=self.cfg["last_host"], placeholder="imap.example.com", id="host")
@@ -279,21 +303,148 @@ class RunScreen(Screen):
         self.log("Press q to quit.")
 
 
+class BrowseScreen(Screen):
+    """Browse, search, filter, and export contacts from a local db."""
+
+    BINDINGS = [("escape", "app.pop_screen", "Back")]
+
+    def __init__(self):
+        super().__init__()
+        self.cfg = cfgmod.load()
+        self.store: ContactStore | None = None
+        self.page_offset = 0
+        self.total = 0
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Horizontal(id="db-row", classes="toolbar"):
+            yield Input(value=self.cfg["db_path"], placeholder="contacts.db", id="db_path")
+            yield Button("Load", id="load", variant="primary")
+        with Horizontal(id="filter-row", classes="toolbar"):
+            yield Input(placeholder="search name or email", id="search")
+            yield Input(placeholder="from YYYY-MM-DD", id="date_from")
+            yield Input(placeholder="to YYYY-MM-DD", id="date_to")
+            yield Input(placeholder="folder", id="folder")
+            yield Button("Search", id="search_btn", variant="primary")
+        yield DataTable(id="table", zebra_stripes=True, cursor_type="row")
+        with Horizontal(id="page-row", classes="toolbar"):
+            yield Button("< Prev", id="prev")
+            yield Static("", id="page_info")
+            yield Button("Next >", id="next")
+        with Horizontal(id="export-row", classes="toolbar"):
+            yield Input(value="export.csv", id="export_path")
+            yield Button("Export matches to CSV", id="export")
+        yield Static("", id="browse_status")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#table", DataTable)
+        table.add_columns("Email", "Name", "Msgs", "Folders", "First seen", "Last seen")
+        self.load_db()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id
+        if button_id == "load":
+            self.load_db()
+        elif button_id == "search_btn":
+            self.page_offset = 0
+            self.run_search()
+        elif button_id == "prev":
+            self.page_offset = max(0, self.page_offset - PAGE_SIZE)
+            self.run_search()
+        elif button_id == "next":
+            if self.page_offset + PAGE_SIZE < self.total:
+                self.page_offset += PAGE_SIZE
+                self.run_search()
+        elif button_id == "export":
+            self.export_matches()
+
+    def load_db(self) -> None:
+        db_path = self.query_one("#db_path", Input).value.strip()
+        status = self.query_one("#browse_status", Static)
+        if not db_path:
+            status.update("[red]Enter a db path.[/red]")
+            return
+        if self.store:
+            self.store.close()
+        self.store = ContactStore(db_path)
+        cfgmod.save({**self.cfg, "db_path": db_path})
+        self.page_offset = 0
+        self.run_search()
+
+    def _filters(self) -> dict:
+        return {
+            "search": self.query_one("#search", Input).value.strip(),
+            "date_from": self.query_one("#date_from", Input).value.strip(),
+            "date_to": self.query_one("#date_to", Input).value.strip(),
+            "folder": self.query_one("#folder", Input).value.strip(),
+        }
+
+    def run_search(self) -> None:
+        status = self.query_one("#browse_status", Static)
+        if not self.store:
+            return
+        rows, total = self.store.search(
+            **self._filters(), limit=PAGE_SIZE, offset=self.page_offset
+        )
+        self.total = total
+        table = self.query_one("#table", DataTable)
+        table.clear()
+        for email, name, count, folders, first_seen, last_seen in rows:
+            table.add_row(email, name or "", str(count), folders, first_seen or "", last_seen or "")
+
+        page = self.page_offset // PAGE_SIZE + 1
+        last_page = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        self.query_one("#page_info", Static).update(f"Page {page}/{last_page} ({total} contacts)")
+        self.query_one("#prev", Button).disabled = self.page_offset == 0
+        self.query_one("#next", Button).disabled = self.page_offset + PAGE_SIZE >= total
+        status.update("")
+
+    def export_matches(self) -> None:
+        status = self.query_one("#browse_status", Static)
+        if not self.store:
+            status.update("[red]Load a db first.[/red]")
+            return
+        path = self.query_one("#export_path", Input).value.strip()
+        if not path:
+            status.update("[red]Enter an export path.[/red]")
+            return
+        count = self.store.export_csv(path, **self._filters())
+        status.update(f"[green]Exported {count} contacts to {path}[/green]")
+
+
 class RolodexApp(App):
-    """Rolodex: entry point. Pushes ConnectScreen, then screens chain Folder -> Domain -> Run."""
+    """Rolodex: entry point. Pushes StartScreen, which leads to either the
+    Connect -> Folder -> Domain -> Run extraction chain, or BrowseScreen."""
 
     TITLE = "Rolodex"
     CSS = """
-    .title { padding: 1 2; text-style: bold; }
-    .hint { padding: 0 2; color: $text-muted; }
+    Screen { align: center middle; }
+    RunScreen, BrowseScreen, FolderScreen, DomainScreen { align: left top; }
+    .title { padding: 1 2; text-style: bold; color: $accent; }
+    .hint { padding: 0 2 1 2; color: $text-muted; }
+    .panel { width: 70; border: round $primary; padding: 1 2; }
+    #start-panel { width: 50; align: center middle; }
+    #start-panel Button { width: 1fr; margin: 1 0 0 0; }
     #form { padding: 2 4; }
     #add-row { height: 3; padding: 0 2; }
     #new_domain { width: 1fr; }
     #log-wrap { height: 1fr; }
+    .toolbar { height: 3; padding: 0 1; }
+    .toolbar Input { width: 1fr; margin-right: 1; }
+    #table { height: 1fr; margin: 0 1; }
+    #page_info { width: 1fr; content-align: center middle; }
+    #browse_status { padding: 0 2; }
     """
 
+    def get_system_commands(self, screen: Screen):
+        for command in super().get_system_commands(screen):
+            if "screenshot" in command.title.lower():
+                continue
+            yield command
+
     def on_mount(self) -> None:
-        self.push_screen(ConnectScreen())
+        self.push_screen(StartScreen())
 
 
 if __name__ == "__main__":

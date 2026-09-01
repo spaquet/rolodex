@@ -4,7 +4,7 @@ Rolodex — Python 3.11+ TUI (Textual). No secrets on disk — password prompted
 Config (`~/.config/email_extract/config.json`): excluded domains, last host/port/user, db path only.
 
 Files:
-- `app.py` — Textual screens: Connect → Folder select → Domain filter → Run (extraction + progress)
+- `app.py` — Textual screens: Start → (Connect → Folder select → Domain filter → Run) or Browse (search/filter/paginate/export)
 - `imap_client.py` — generic IMAP: connect, list folders, fetch From/To/Cc/Date headers
 - `storage.py` — sqlite/libsql-compatible output, upsert contacts (most-frequent name wins)
 - `config.py` — non-secret settings persistence

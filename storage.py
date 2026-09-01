@@ -1,8 +1,11 @@
 """SQLite output store. Local file is libsql-compatible (plain sqlite3 file format);
 sync/import into Turso separately with `turso db shell <db> < dump` or `turso db import`."""
+import csv
 import sqlite3
 from collections import defaultdict
 from contextlib import closing
+
+SORTABLE_COLUMNS = {"name", "email", "message_count", "first_seen", "last_seen"}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS contacts (
@@ -109,3 +112,99 @@ class ContactStore:
     def contact_count(self) -> int:
         """Number of distinct email addresses recorded so far."""
         return len(self._msg_count)
+
+    @staticmethod
+    def _build_where(search: str, date_from: str, date_to: str, folder: str):
+        """Build a WHERE clause + params for the contacts table filters shared
+        by search() and export_csv()."""
+        clauses = []
+        params: list = []
+        if search:
+            clauses.append("(name LIKE ? OR email LIKE ?)")
+            like = f"%{search}%"
+            params += [like, like]
+        if date_from:
+            clauses.append("last_seen >= ?")
+            params.append(date_from)
+        if date_to:
+            clauses.append("last_seen <= ?")
+            params.append(date_to)
+        if folder:
+            clauses.append("(',' || folders || ',') LIKE ?")
+            params.append(f"%,{folder},%")
+        where_sql = " WHERE " + " AND ".join(clauses) if clauses else ""
+        return where_sql, params
+
+    def search(
+        self,
+        search: str = "",
+        date_from: str = "",
+        date_to: str = "",
+        folder: str = "",
+        order_by: str = "last_seen",
+        descending: bool = True,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[tuple], int]:
+        """Query stored contacts with optional text/date/folder filters, paginated.
+
+        Args:
+            search: Substring matched (case-sensitive per sqlite LIKE) against
+                name or email.
+            date_from / date_to: Inclusive ISO-8601 bounds on last_seen.
+            folder: Restrict to contacts seen in this exact folder name.
+            order_by: Column to sort by; must be one of SORTABLE_COLUMNS.
+            descending: Sort direction.
+            limit / offset: Page window.
+
+        Returns:
+            (rows, total) where rows are
+            (email, name, message_count, folders, first_seen, last_seen)
+            tuples for the requested page, and total is the full match count
+            across all pages.
+        """
+        if order_by not in SORTABLE_COLUMNS:
+            order_by = "last_seen"
+        where_sql, params = self._build_where(search, date_from, date_to, folder)
+        direction = "DESC" if descending else "ASC"
+        total = self._conn.execute(
+            f"SELECT COUNT(*) FROM contacts{where_sql}", params
+        ).fetchone()[0]
+        rows = self._conn.execute(
+            f"""
+            SELECT email, name, message_count, folders, first_seen, last_seen
+            FROM contacts{where_sql}
+            ORDER BY {order_by} {direction}
+            LIMIT ? OFFSET ?
+            """,
+            [*params, limit, offset],
+        ).fetchall()
+        return rows, total
+
+    def export_csv(
+        self,
+        path: str,
+        search: str = "",
+        date_from: str = "",
+        date_to: str = "",
+        folder: str = "",
+    ) -> int:
+        """Write every contact matching the given filters (all pages) to a CSV file.
+
+        Returns:
+            Number of rows written.
+        """
+        where_sql, params = self._build_where(search, date_from, date_to, folder)
+        rows = self._conn.execute(
+            f"""
+            SELECT email, name, message_count, folders, first_seen, last_seen
+            FROM contacts{where_sql}
+            ORDER BY name
+            """,
+            params,
+        ).fetchall()
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["email", "name", "message_count", "folders", "first_seen", "last_seen"])
+            writer.writerows(rows)
+        return len(rows)
