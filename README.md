@@ -1,8 +1,17 @@
 # Rolodex
 
-![Rolodex — email contacts organized into a private local address book](assets/rolodex-og.png)
+![Rolodex — email contacts organized into a private local address book](assets/rolodex-og.webp)
 
 TUI to scan your IMAP mailbox and extract every name + email address you've corresponded with, into a local sqlite/libsql file.
+
+## Features
+
+- Connects to any IMAP server; credentials are never saved.
+- Extracts contacts from `From`, `To`, and `Cc` headers without storing messages or raw headers.
+- Resumes scans incrementally using per-folder UID checkpoints.
+- Supports folder selection and persistent domain exclusions.
+- Deduplicates contacts, tracks message counts and dates, and keeps the most frequently seen name.
+- Searches and filters local databases by name, email, folder, or date, with paginated results and CSV export.
 
 ## Setup
 
