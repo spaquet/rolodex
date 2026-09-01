@@ -14,6 +14,8 @@ Database (SQLite WAL, libsql-compatible; use one file per mailbox):
 - `extraction_state` — `host`, `username`, `folder`, `uidvalidity`, `last_uid`; primary key is (`host`, `username`, `folder`). This is internal scan state, not contact data.
 - Contact changes and their extraction checkpoint must commit in the same transaction. Never advance `last_uid` separately.
 - Never store passwords, message bodies, raw messages, or raw headers.
+- A message is skipped entirely (no contact, no signature) when it's from the connected account itself, from a no-reply/automated address (`imap_client.is_noreply_sender`), or bulk/mailing-list mail identified via `List-Unsubscribe`/`List-Id`/`Precedence` headers (`imap_client.is_bulk_message`) — see SIGNATURE_EXTRACTION.md.
+- Signature extraction runs once per sender per whole run (newest-dated message only, across all selected folders), not once per message — see SIGNATURE_EXTRACTION.md's "Performance Rework" section.
 
 Run: `pip install -r requirements.txt && python app.py`
 

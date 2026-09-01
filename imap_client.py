@@ -12,6 +12,11 @@ FETCH_BATCH_SIZE = 1000
 MESSAGE_BATCH_SIZE = 20
 
 FOLDER_LINE_RE = re.compile(r'\((?P<flags>[^)]*)\)\s+"(?P<delim>[^"]*)"\s+(?P<name>.+)')
+NOREPLY_RE = re.compile(
+    r"(?:^|[._-])(no-?reply|do-?not-?reply|donotreply|mailer-daemon|postmaster)(?:[._-]|$)",
+    re.IGNORECASE,
+)
+HEADER_FIELDS = "(FROM TO CC DATE LIST-UNSUBSCRIBE LIST-ID PRECEDENCE)"
 
 
 @dataclass
@@ -166,7 +171,7 @@ def fetch_header_batches(
         batch = msg_uids[i : i + batch_size]
         id_set = b",".join(batch)
         status, data = conn.uid(
-            "fetch", id_set, "(BODY.PEEK[HEADER.FIELDS (FROM TO CC DATE)])"
+            "fetch", id_set, f"(BODY.PEEK[HEADER.FIELDS {HEADER_FIELDS}])"
         )
         if status != "OK":
             raise ImapError("UID FETCH failed")
@@ -288,6 +293,27 @@ def parse_sender(raw_headers: str) -> str:
         if addrs and addrs[0][1]:
             return addrs[0][1].strip()
     return ""
+
+
+def is_noreply_sender(addr: str) -> bool:
+    """Whether an address's local part looks like an automated no-reply sender."""
+    local = addr.split("@", 1)[0] if addr else ""
+    return bool(NOREPLY_RE.search(local))
+
+
+def is_bulk_message(raw_headers: str) -> bool:
+    """Whether raw header text carries standard bulk/mailing-list markers.
+
+    Checks List-Unsubscribe/List-Id (RFC 2369/8058) and Precedence: bulk|list,
+    all included in the header fields fetch_header_batches() requests.
+    """
+    for line in raw_headers.splitlines():
+        low = line.lower()
+        if low.startswith("list-unsubscribe:") or low.startswith("list-id:"):
+            return True
+        if low.startswith("precedence:") and ("bulk" in low or "list" in low):
+            return True
+    return False
 
 
 def parse_date(raw_headers: str) -> str:

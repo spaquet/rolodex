@@ -413,9 +413,12 @@ class RunScreen(Screen):
         """Worker: scan each selected folder, extract contacts, write to storage.
 
         Runs entirely off the UI thread; progress and log updates are
-        marshalled back via `app.call_from_thread`. Flushes after each
-        folder so a crash mid-run only loses the folder in progress, not
-        everything scanned so far.
+        marshalled back via `app.call_from_thread`. Contacts are flushed
+        (with checkpoint) after each folder's header pass, so a crash mid-run
+        only loses the folder in progress. Signature extraction runs as a
+        separate pass afterward, deduped to a single newest message per
+        sender across the whole run (not per folder), and flushed
+        per-folder as it completes.
         """
         store = ContactStore(self.db_path)
         progress = self.query_one("#progress", ProgressBar)
@@ -429,6 +432,13 @@ class RunScreen(Screen):
             self.done = True
             self.app.call_from_thread(status.update, f"[red]Talon failed to start: {e}[/red]")
             return
+
+        own_address = self.username.lower()
+        # sender -> (folder, uid, date) of the single newest candidate message
+        # seen so far anywhere in this run, used to fetch each sender's
+        # signature exactly once regardless of how many folders/messages
+        # they appear in.
+        sig_targets: dict[str, tuple[str, bytes, str]] = {}
 
         total_folders = len(self.folders)
         for fi, folder in enumerate(self.folders, start=1):
@@ -463,14 +473,17 @@ class RunScreen(Screen):
             self.append_log(f"{folder}: {len(uids)} new messages")
             self.app.call_from_thread(progress.update, total=len(uids) or 1, progress=0)
             done = 0
-            newest_uid_by_sender: dict[str, tuple[bytes, str]] = {}
             try:
                 for batch, headers_list in im.fetch_header_batches(self.conn, uids):
                     for uid, raw_headers in zip(batch, headers_list):
                         try:
+                            if im.is_bulk_message(raw_headers):
+                                continue
+                            sender = im.parse_sender(raw_headers)
+                            if im.is_noreply_sender(sender):
+                                continue
                             addresses = im.parse_addresses(raw_headers)
                             date = im.parse_date(raw_headers)
-                            sender = im.parse_sender(raw_headers)
                         except Exception as e:
                             self.append_log(
                                 f"[yellow]{folder} UID {uid.decode()}: skipped unparseable headers: {e}[/yellow]"
@@ -483,10 +496,14 @@ class RunScreen(Screen):
                             store.record(addr, name, folder, date)
                         sender_l = sender.lower()
                         sender_domain = sender_l.split("@")[-1] if "@" in sender_l else ""
-                        if sender_l and sender_domain not in self.excluded_domains:
-                            prev = newest_uid_by_sender.get(sender_l)
-                            if not prev or (date and (not prev[1] or date >= prev[1])):
-                                newest_uid_by_sender[sender_l] = (uid, date)
+                        if (
+                            sender_l
+                            and sender_l != own_address
+                            and sender_domain not in self.excluded_domains
+                        ):
+                            prev = sig_targets.get(sender_l)
+                            if not prev or (date and (not prev[2] or date >= prev[2])):
+                                sig_targets[sender_l] = (folder, uid, date)
                     done += len(batch)
                     self.app.call_from_thread(progress.update, progress=done)
             except im.ImapError as e:
@@ -495,11 +512,26 @@ class RunScreen(Screen):
                 continue
             self.app.call_from_thread(progress.update, progress=len(uids) or 1)
 
-            sig_uids = [uid for uid, _ in newest_uid_by_sender.values()]
-            if sig_uids:
-                self.append_log(f"{folder}: extracting signatures for {len(sig_uids)} senders")
-                self.app.call_from_thread(progress.update, total=len(sig_uids), progress=0)
-                done = 0
+            newest_uid = int(uids[-1]) if uids else last_uid
+            store.flush((self.host, self.username, folder, uidvalidity, newest_uid))
+
+        by_folder: dict[str, list[bytes]] = {}
+        for sender_l, (folder, uid, _) in sig_targets.items():
+            by_folder.setdefault(folder, []).append(uid)
+
+        total_targets = sum(len(uids) for uids in by_folder.values())
+        if total_targets:
+            self.append_log(f"Extracting signatures for {total_targets} senders")
+            self.app.call_from_thread(progress.update, total=total_targets, progress=0)
+            done = 0
+            for folder, sig_uids in by_folder.items():
+                try:
+                    im.select_folder(self.conn, folder)
+                except im.ImapError as e:
+                    self.append_log(f"[red]{folder}: could not reselect for signatures: {e}[/red]")
+                    done += len(sig_uids)
+                    self.app.call_from_thread(progress.update, progress=done)
+                    continue
                 try:
                     for batch, messages in im.fetch_message_batches(self.conn, sig_uids):
                         for uid, raw_message in zip(batch, messages):
@@ -517,8 +549,7 @@ class RunScreen(Screen):
                         self.app.call_from_thread(progress.update, progress=done)
                 except im.ImapError as e:
                     self.append_log(f"[red]{folder}: signature extraction pass failed: {e}[/red]")
-            newest_uid = int(uids[-1]) if uids else last_uid
-            store.flush((self.host, self.username, folder, uidvalidity, newest_uid))
+                store.flush()
 
         count = store.contact_count
         store.close()

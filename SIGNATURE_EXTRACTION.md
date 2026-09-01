@@ -355,3 +355,54 @@ Implemented and closed out:
 Known remaining gap: no test against a live/real IMAP server — all IMAP
 interaction is exercised through fakes, consistent with the rest of the
 test suite (`test_incremental.py`).
+
+## Performance Rework (post-launch)
+
+The first version ran Talon's `signature.extract` on every message
+(`BODY.PEEK[]` fetched for all of them), because signature detection was
+folded into the same per-message loop as contact extraction. At mailbox
+scale (~28k messages) this took hours: full-message IMAP transfer plus an
+ML classifier call per message, most of which produced a signature that was
+immediately discarded (`storage.py`'s upsert keeps only the latest-dated
+signature per address — every earlier extraction for the same sender was
+wasted work).
+
+Extraction is now two passes per run:
+
+1. **Header pass** (per folder, as before extraction existed at all):
+   `fetch_header_batches` pulls `FROM TO CC DATE LIST-UNSUBSCRIBE LIST-ID
+   PRECEDENCE` only. This builds every contact row exactly as before, and
+   also picks — for each sender seen anywhere in the run, across every
+   selected folder — the single newest-dated candidate message. Contacts and
+   the folder's checkpoint are flushed together immediately after this pass,
+   same crash-safety guarantee as before.
+2. **Signature pass** (once, after all folders' header passes complete):
+   fetches full bodies (`BODY.PEEK[]`) for only that deduped set — at most
+   one message per sender for the entire run, not per folder and never the
+   sender's older history. Talon only ever sees each sender's single
+   newest message. Results are written via the new
+   `ContactStore.record_signature`, which updates only the signature columns
+   without re-touching `message_count`/`folders`/first-seen/last-seen (those
+   already own by `record()`/the header pass), then flushed per folder.
+
+A message is skipped entirely (no contact recorded, no signature
+candidate) when, from header fields alone:
+
+- **Sent by the account owner** (`From` == the connected mailbox's own
+  address) — not a contact, nothing to extract.
+- **Automated/no-reply sender** — local-part matches
+  `no-?reply|do-?not-?reply|donotreply|mailer-daemon|postmaster`
+  (`imap_client.is_noreply_sender`).
+- **Bulk/mailing-list mail** — `List-Unsubscribe` or `List-Id` present, or
+  `Precedence: bulk`/`list` (RFC 2369/8058 machine-readable markers,
+  `imap_client.is_bulk_message`). Body text (e.g. an "unsubscribe" string)
+  is deliberately not scanned for this — that would require fetching the
+  body, defeating the point of the header-only pass.
+
+None of this changes what's stored: still From-only signatures, still
+latest-dated-wins, still no message bodies/raw headers persisted. It only
+changes how many IMAP fetches and Talon calls it takes to get there.
+
+`RunScreen`'s error log lines now include the folder and message UID, and
+`RichLog` is constructed with `markup=True` so `[red]`/`[yellow]` tags
+actually render as color instead of printing literally.
