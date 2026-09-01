@@ -16,11 +16,13 @@ from textual.widgets import (
     Label,
     ListItem,
     ListView,
+    OptionList,
     ProgressBar,
     RichLog,
     SelectionList,
     Static,
 )
+from textual.widgets.option_list import Option
 from textual.widgets.selection_list import Selection
 
 import config as cfgmod
@@ -28,6 +30,33 @@ import imap_client as im
 from storage import ContactStore
 
 PAGE_SIZE = 50
+SEARCH_OPERATORS = ["folder:", "after:", "before:"]
+
+
+def parse_query(text: str) -> dict:
+    """Turn a Gmail-style single search string into store.search() filter kwargs.
+
+    Recognizes `folder:NAME`, `after:DATE`, `before:DATE` tokens anywhere in
+    the string; everything else is treated as free-text name/email search.
+    """
+    search_terms = []
+    date_from = date_to = folder = ""
+    for tok in text.split():
+        key, sep, val = tok.partition(":")
+        if sep and val and key.lower() == "folder":
+            folder = val
+        elif sep and val and key.lower() == "after":
+            date_from = val
+        elif sep and val and key.lower() == "before":
+            date_to = val
+        else:
+            search_terms.append(tok)
+    return {
+        "search": " ".join(search_terms),
+        "date_from": date_from,
+        "date_to": date_to,
+        "folder": folder,
+    }
 
 
 class StartScreen(Screen):
@@ -252,7 +281,7 @@ class RunScreen(Screen):
         """Kick off extraction as soon as this screen is shown."""
         threading.Thread(target=self.run_extraction, daemon=True).start()
 
-    def log(self, msg: str) -> None:
+    def append_log(self, msg: str) -> None:
         """Append a line to the on-screen log (thread-safe)."""
         self.app.call_from_thread(self.query_one("#log", RichLog).write, msg)
 
@@ -272,10 +301,10 @@ class RunScreen(Screen):
             try:
                 ids = im.search_all(self.conn, folder)
             except im.ImapError as e:
-                self.log(f"[red]Skip {folder}: {e}[/red]")
+                self.append_log(f"[red]Skip {folder}: {e}[/red]")
                 continue
 
-            self.log(f"{folder}: {len(ids)} messages")
+            self.append_log(f"{folder}: {len(ids)} messages")
             self.app.call_from_thread(progress.update, total=len(ids) or 1, progress=0)
             done = 0
             for raw_headers in im.fetch_headers(self.conn, ids):
@@ -300,7 +329,7 @@ class RunScreen(Screen):
         self.app.call_from_thread(
             status.update, f"[green]Done. {count} unique contacts written to {self.db_path}[/green]"
         )
-        self.log("Press q to quit.")
+        self.append_log("Press q to quit.")
 
 
 class BrowseScreen(Screen):
@@ -314,18 +343,21 @@ class BrowseScreen(Screen):
         self.store: ContactStore | None = None
         self.page_offset = 0
         self.total = 0
+        self._suggest_prefix = ""
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="db-row", classes="toolbar"):
             yield Input(value=self.cfg["db_path"], placeholder="contacts.db", id="db_path")
             yield Button("Load", id="load", variant="primary")
-        with Horizontal(id="filter-row", classes="toolbar"):
-            yield Input(placeholder="search name or email", id="search")
-            yield Input(placeholder="from YYYY-MM-DD", id="date_from")
-            yield Input(placeholder="to YYYY-MM-DD", id="date_to")
-            yield Input(placeholder="folder", id="folder")
-            yield Button("Search", id="search_btn", variant="primary")
+        with Vertical(id="search-wrap"):
+            with Horizontal(classes="toolbar"):
+                yield Input(
+                    placeholder="Search contacts…  try folder: after: before:",
+                    id="query",
+                )
+                yield Button("Search", id="search_btn", variant="primary")
+            yield OptionList(id="suggestions")
         yield DataTable(id="table", zebra_stripes=True, cursor_type="row")
         with Horizontal(id="page-row", classes="toolbar"):
             yield Button("< Prev", id="prev")
@@ -340,6 +372,7 @@ class BrowseScreen(Screen):
     def on_mount(self) -> None:
         table = self.query_one("#table", DataTable)
         table.add_columns("Email", "Name", "Msgs", "Folders", "First seen", "Last seen")
+        self.query_one("#suggestions", OptionList).display = False
         self.load_db()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -347,6 +380,7 @@ class BrowseScreen(Screen):
         if button_id == "load":
             self.load_db()
         elif button_id == "search_btn":
+            self.query_one("#suggestions", OptionList).display = False
             self.page_offset = 0
             self.run_search()
         elif button_id == "prev":
@@ -373,12 +407,49 @@ class BrowseScreen(Screen):
         self.run_search()
 
     def _filters(self) -> dict:
-        return {
-            "search": self.query_one("#search", Input).value.strip(),
-            "date_from": self.query_one("#date_from", Input).value.strip(),
-            "date_to": self.query_one("#date_to", Input).value.strip(),
-            "folder": self.query_one("#folder", Input).value.strip(),
-        }
+        return parse_query(self.query_one("#query", Input).value.strip())
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "query":
+            self._update_suggestions(event.value)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "query":
+            self.query_one("#suggestions", OptionList).display = False
+            self.page_offset = 0
+            self.run_search()
+
+    def _update_suggestions(self, value: str) -> None:
+        """Gmail-style operator/value suggestions for the last word being typed."""
+        space = value.rfind(" ")
+        self._suggest_prefix = value[: space + 1]
+        current = value[space + 1 :]
+
+        options: list[str] = []
+        if ":" not in current:
+            options = [op for op in SEARCH_OPERATORS if op.startswith(current)] if current else SEARCH_OPERATORS
+        elif current.lower().startswith("folder:") and self.store:
+            val = current[len("folder:") :]
+            options = [f"folder:{f}" for f in self.store.distinct_folders() if f.lower().startswith(val.lower())]
+
+        suggestions = self.query_one("#suggestions", OptionList)
+        suggestions.clear_options()
+        if options:
+            for opt in options:
+                suggestions.add_option(Option(opt, id=opt))
+            suggestions.display = True
+        else:
+            suggestions.display = False
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id != "suggestions":
+            return
+        chosen = str(event.option.id)
+        inp = self.query_one("#query", Input)
+        inp.value = self._suggest_prefix + chosen + ("" if chosen.endswith(":") else " ")
+        inp.cursor_position = len(inp.value)
+        self.query_one("#suggestions", OptionList).display = False
+        inp.focus()
 
     def run_search(self) -> None:
         status = self.query_one("#browse_status", Static)
@@ -419,22 +490,110 @@ class RolodexApp(App):
 
     TITLE = "Rolodex"
     CSS = """
-    Screen { align: center middle; }
-    RunScreen, BrowseScreen, FolderScreen, DomainScreen { align: left top; }
-    .title { padding: 1 2; text-style: bold; color: $accent; }
-    .hint { padding: 0 2 1 2; color: $text-muted; }
-    .panel { width: 70; border: round $primary; padding: 1 2; }
-    #start-panel { width: 50; align: center middle; }
-    #start-panel Button { width: 1fr; margin: 1 0 0 0; }
-    #form { padding: 2 4; }
-    #add-row { height: 3; padding: 0 2; }
-    #new_domain { width: 1fr; }
-    #log-wrap { height: 1fr; }
-    .toolbar { height: 3; padding: 0 1; }
+    Screen {
+        align: center middle;
+        background: $surface;
+    }
+    RunScreen, BrowseScreen, FolderScreen, DomainScreen {
+        align: left top;
+        background: $surface;
+    }
+
+    .title {
+        padding: 1 2 0 2;
+        text-style: none;
+        color: $text;
+    }
+    .hint {
+        padding: 0 2 1 2;
+        color: $text-muted;
+        text-style: italic;
+    }
+
+    .panel {
+        width: 72;
+        border: round $primary-muted;
+        background: $panel;
+        padding: 1 3;
+    }
+    #start-panel {
+        width: 46;
+        align: center middle;
+        border: round $primary-muted;
+    }
+    #start-panel .title {
+        text-align: center;
+        text-style: bold;
+        color: $accent;
+        width: 1fr;
+    }
+    #start-panel Button {
+        width: 1fr;
+        margin: 1 0 0 0;
+        border: none;
+    }
+
+    #form { padding: 1 3; }
+    #form Label { color: $text-muted; padding: 1 0 0 0; }
+
+    Input {
+        border: round $primary-muted;
+        background: $boost;
+    }
+    Input:focus {
+        border: round $accent;
+    }
+
+    Button {
+        border: none;
+        min-width: 12;
+    }
+
+    SelectionList {
+        border: round $primary-muted;
+        background: $panel;
+        margin: 1 0;
+    }
+
+    #add-row { height: 3; padding: 0 0 1 0; }
+    #new_domain { width: 1fr; margin-right: 1; }
+    ListView {
+        border: round $primary-muted;
+        background: $panel;
+        height: auto;
+        max-height: 12;
+        margin: 0 0 1 0;
+    }
+
+    #log-wrap {
+        height: 1fr;
+        border: round $primary-muted;
+        margin: 0 2 1 2;
+    }
+    #log { background: $panel; }
+    #folder_status { padding: 1 2; }
+    ProgressBar { margin: 0 2 1 2; }
+
+    .toolbar { height: 3; padding: 0 1; margin-bottom: 1; }
     .toolbar Input { width: 1fr; margin-right: 1; }
-    #table { height: 1fr; margin: 0 1; }
-    #page_info { width: 1fr; content-align: center middle; }
-    #browse_status { padding: 0 2; }
+
+    #search-wrap { padding: 0 1; height: auto; }
+    #suggestions {
+        border: round $accent;
+        background: $panel;
+        height: auto;
+        max-height: 8;
+        margin: 0 1 1 1;
+    }
+
+    #table {
+        height: 1fr;
+        margin: 0 1;
+        border: round $primary-muted;
+        background: $panel;
+    }
+    #page_info { width: 1fr; content-align: center middle; color: $text-muted; }
+    #browse_status { padding: 0 2 1 2; color: $text-muted; }
     """
 
     def get_system_commands(self, screen: Screen):

@@ -113,6 +113,14 @@ class ContactStore:
         """Number of distinct email addresses recorded so far."""
         return len(self._msg_count)
 
+    def distinct_folders(self) -> list[str]:
+        """All distinct folder names present across stored contacts, sorted."""
+        rows = self._conn.execute("SELECT DISTINCT folders FROM contacts WHERE folders != ''").fetchall()
+        names: set[str] = set()
+        for (folders,) in rows:
+            names.update(folders.split(","))
+        return sorted(names)
+
     @staticmethod
     def _build_where(search: str, date_from: str, date_to: str, folder: str):
         """Build a WHERE clause + params for the contacts table filters shared
