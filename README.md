@@ -1,5 +1,7 @@
 # Rolodex
 
+![Rolodex — email contacts organized into a private local address book](assets/rolodex-og.png)
+
 TUI to scan your IMAP mailbox and extract every name + email address you've corresponded with, into a local sqlite/libsql file.
 
 ## Setup
