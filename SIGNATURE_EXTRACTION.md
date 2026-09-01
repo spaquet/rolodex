@@ -1,5 +1,10 @@
 # Talon Signature Extraction
 
+Signature detection is delegated entirely to [Mailgun's Talon](https://github.com/mailgun/talon),
+an external open-source library — not code written for this project. Rolodex
+consumes it as a pinned dependency (see [Tiny Talon Fork](#tiny-talon-fork)
+below) and never reimplements its signature-detection logic.
+
 ## Goal
 
 Extract the sender's signature from each email, keep the extracted signature with

@@ -7,7 +7,7 @@ TUI to scan your IMAP mailbox and extract every name + email address you've corr
 ## Features
 
 - Connects to any IMAP server; credentials are never saved.
-- Extracts contacts from `From`, `To`, and `Cc` headers and uses Talon to detect sender signatures.
+- Extracts contacts from `From`, `To`, and `Cc` headers and uses [Talon](https://github.com/mailgun/talon) to detect sender signatures.
 - Resumes scans incrementally using per-folder UID checkpoints.
 - Supports folder selection and persistent domain exclusions.
 - Deduplicates contacts, tracks message counts and dates, and keeps the most frequently seen name.
@@ -52,7 +52,7 @@ The output is a SQLite file in WAL mode and is libsql-compatible. Use a separate
 | `message_count` | number of messages the address appeared in (From/To/Cc) |
 | `folders` | comma-separated folders it was seen in |
 | `first_seen` / `last_seen` | ISO timestamps from message `Date` headers |
-| `signature` | latest dated signature Talon extracted for this sender |
+| `signature` | latest dated signature [Talon](https://github.com/mailgun/talon) extracted for this sender |
 | `signature_seen` | ISO timestamp of the message that supplied the signature |
 
 ### `extraction_state`
@@ -82,3 +82,4 @@ turso db shell <your-db> < <(sqlite3 contacts.db .dump)
 - Extracts contacts and sender signatures from every message in the selected folders.
 - Existing incremental databases only scan signatures in new messages; use a fresh database to backfill historical signatures.
 - Credentials are prompted each run, never written to disk. Non-secret settings (excluded domains, last host/user, db path) persist in `~/.config/email_extract/config.json`.
+- Signature detection uses [Mailgun's Talon](https://github.com/mailgun/talon) (a pinned fork; see `SIGNATURE_EXTRACTION.md`), not code written for this project.
