@@ -475,8 +475,12 @@ class RunScreen(Screen):
             self.append_log(f"{folder}: {len(uids)} new messages")
             self.app.call_from_thread(progress.update, total=len(uids) or 1, progress=0)
             done = 0
+            fetch_s = parse_s = 0.0
+            t_mark = time.monotonic()
             try:
                 for batch, headers_list in im.fetch_header_batches(self.conn, uids):
+                    fetch_s += time.monotonic() - t_mark
+                    t_parse = time.monotonic()
                     for uid, raw_headers in zip(batch, headers_list):
                         try:
                             if im.is_bulk_message(raw_headers):
@@ -506,13 +510,15 @@ class RunScreen(Screen):
                             prev = sig_targets.get(sender_l)
                             if not prev or (date and (not prev[2] or date >= prev[2])):
                                 sig_targets[sender_l] = (folder, uid, date)
+                    parse_s += time.monotonic() - t_parse
                     done += len(batch)
                     self.app.call_from_thread(progress.update, progress=done)
                     self.app.call_from_thread(
                         status.update,
                         f"Step 1/2 · [{fi}/{total_folders}] Scanning headers: {folder} "
-                        f"({done}/{len(uids)})",
+                        f"({done}/{len(uids)}, IMAP {fetch_s:.1f}s, parse {parse_s:.1f}s)",
                     )
+                    t_mark = time.monotonic()
             except im.ImapError as e:
                 store.discard()
                 self.append_log(f"[red]Skip {folder}: {e}[/red]")
@@ -536,6 +542,7 @@ class RunScreen(Screen):
             )
             self.app.call_from_thread(progress.update, total=total_targets, progress=0)
             done = 0
+            fetch_s = talon_s = 0.0
             for fj, (folder, sig_uids) in enumerate(by_folder.items(), start=1):
                 try:
                     im.select_folder(self.conn, folder)
@@ -544,8 +551,11 @@ class RunScreen(Screen):
                     done += len(sig_uids)
                     self.app.call_from_thread(progress.update, progress=done)
                     continue
+                t_mark = time.monotonic()
                 try:
                     for batch, messages in im.fetch_message_batches(self.conn, sig_uids):
+                        fetch_s += time.monotonic() - t_mark
+                        t_talon = time.monotonic()
                         for uid, raw_message in zip(batch, messages):
                             try:
                                 _, date, sender, body, subtype = im.parse_message(raw_message)
@@ -557,13 +567,16 @@ class RunScreen(Screen):
                                 continue
                             if found_signature:
                                 store.record_signature(sender, found_signature, date)
+                        talon_s += time.monotonic() - t_talon
                         done += len(batch)
                         self.app.call_from_thread(progress.update, progress=done)
                         self.app.call_from_thread(
                             status.update,
                             f"Step 2/2 · Extracting signatures: {done}/{total_targets} "
-                            f"(folder {fj}/{len(by_folder)}: {folder})",
+                            f"(folder {fj}/{len(by_folder)}: {folder}, "
+                            f"IMAP {fetch_s:.1f}s, Talon {talon_s:.1f}s)",
                         )
+                        t_mark = time.monotonic()
                 except im.ImapError as e:
                     self.append_log(f"[red]{folder}: signature extraction pass failed: {e}[/red]")
                 store.flush()
