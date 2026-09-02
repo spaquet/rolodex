@@ -1,6 +1,10 @@
 """Generic IMAP connection, folder listing, and contact extraction."""
+import base64
+import binascii
 import imaplib
+import quopri
 import re
+import time
 from dataclasses import dataclass
 from email import policy
 from email.header import decode_header
@@ -175,31 +179,216 @@ def fetch_header_batches(
         )
         if status != "OK":
             raise ImapError("UID FETCH failed")
-        yield batch, [
+        headers = [
             part[1].decode(errors="replace")
             for part in data
             if isinstance(part, tuple) and len(part) > 1
         ]
-
-
-def fetch_message_batches(
-    conn: imaplib.IMAP4, msg_uids: list[bytes], batch_size: int = MESSAGE_BATCH_SIZE
-):
-    """Fetch complete messages without marking them read, yielding completed batches."""
-    # ponytail: whole-message fetch keeps IMAP generic; use BODYSTRUCTURE if traffic matters.
-    for i in range(0, len(msg_uids), batch_size):
-        batch = msg_uids[i : i + batch_size]
-        status, data = conn.uid("fetch", b",".join(batch), "(BODY.PEEK[])")
-        if status != "OK":
-            raise ImapError("UID FETCH failed")
-        messages = [
-            part[1]
-            for part in data
-            if isinstance(part, tuple) and len(part) > 1
-        ]
-        if len(messages) != len(batch):
+        if len(headers) != len(batch):
             raise ImapError("UID FETCH returned an incomplete batch")
-        yield batch, messages
+        yield batch, headers
+
+
+def _parse_imap_value(raw: bytes, pos: int = 0):
+    while pos < len(raw) and raw[pos : pos + 1].isspace():
+        pos += 1
+    if pos >= len(raw):
+        raise ValueError("incomplete IMAP value")
+    if raw[pos : pos + 1] == b"(":
+        values = []
+        pos += 1
+        while True:
+            while pos < len(raw) and raw[pos : pos + 1].isspace():
+                pos += 1
+            if pos >= len(raw):
+                raise ValueError("incomplete IMAP list")
+            if raw[pos : pos + 1] == b")":
+                return values, pos + 1
+            value, pos = _parse_imap_value(raw, pos)
+            values.append(value)
+    if raw[pos : pos + 1] == b'"':
+        out = bytearray()
+        pos += 1
+        while pos < len(raw):
+            char = raw[pos]
+            pos += 1
+            if char == 34:
+                return out.decode(errors="replace"), pos
+            if char == 92 and pos < len(raw):
+                char = raw[pos]
+                pos += 1
+            out.append(char)
+        raise ValueError("incomplete IMAP string")
+    if raw[pos : pos + 1] == b"{":
+        end = raw.find(b"}", pos)
+        if end < 0:
+            raise ValueError("incomplete IMAP literal")
+        size = int(raw[pos + 1 : end])
+        start = end + 1
+        if raw[start : start + 2] == b"\r\n":
+            start += 2
+        if len(raw) < start + size:
+            raise ValueError("incomplete IMAP literal")
+        return raw[start : start + size].decode(errors="replace"), start + size
+    end = pos
+    while end < len(raw) and not raw[end : end + 1].isspace() and raw[end : end + 1] != b")":
+        end += 1
+    atom = raw[pos:end]
+    if atom.upper() == b"NIL":
+        return None, end
+    return (int(atom) if atom.isdigit() else atom.decode(errors="replace")), end
+
+
+def _bodystructure_records(data) -> tuple[dict[bytes, list], int, int]:
+    records = {}
+    pending = b""
+    transferred = message_bytes = 0
+    for item in data:
+        if isinstance(item, tuple):
+            piece = item[0] + b"\r\n" + item[1]
+        elif isinstance(item, bytes):
+            piece = item
+        else:
+            continue
+        transferred += len(piece)
+        if not pending and b"BODYSTRUCTURE" not in piece:
+            continue
+        pending = pending + b" " + piece if pending else piece
+        marker = re.search(rb"\bUID\s+(\d+)\b.*?\bBODYSTRUCTURE\s+", pending, re.DOTALL)
+        if not marker:
+            continue
+        try:
+            structure, _ = _parse_imap_value(pending, marker.end())
+        except ValueError:
+            continue
+        records[marker.group(1)] = structure
+        size = re.search(rb"\bRFC822\.SIZE\s+(\d+)\b", pending)
+        if size:
+            message_bytes += int(size.group(1))
+        pending = b""
+    if pending:
+        raise ImapError("UID FETCH returned an incomplete BODYSTRUCTURE")
+    return records, transferred, message_bytes
+
+
+def _params(values) -> dict[str, str]:
+    if not isinstance(values, list):
+        return {}
+    return {
+        str(values[i]).lower(): str(values[i + 1])
+        for i in range(0, len(values) - 1, 2)
+    }
+
+
+def _preferred_text_part(structure: list):
+    candidates = []
+
+    def visit(part, path):
+        if not isinstance(part, list) or not part:
+            return
+        if isinstance(part[0], list):
+            children = []
+            for value in part:
+                if not isinstance(value, list):
+                    break
+                children.append(value)
+            for index, child in enumerate(children, 1):
+                visit(child, f"{path}.{index}" if path else str(index))
+            return
+        if len(part) < 7 or str(part[0]).lower() != "text":
+            return
+        subtype = str(part[1]).lower()
+        params = _params(part[2])
+        disposition = part[9] if len(part) > 9 else None
+        disposition_params = _params(disposition[1]) if isinstance(disposition, list) and len(disposition) > 1 else {}
+        if (
+            subtype not in ("plain", "html")
+            or "name" in params
+            or "filename" in params
+            or "filename" in disposition_params
+            or isinstance(disposition, list)
+            and disposition
+            and str(disposition[0]).lower() == "attachment"
+        ):
+            return
+        candidates.append((subtype != "plain", path or "1", subtype, params.get("charset", "utf-8"), str(part[5])))
+
+    visit(structure, "")
+    return min(candidates, default=None)
+
+
+def _decode_text_part(raw: bytes, encoding: str, charset: str) -> str:
+    if encoding.lower() == "base64":
+        raw = base64.b64decode(raw, validate=False)
+    elif encoding.lower() == "quoted-printable":
+        raw = quopri.decodestring(raw)
+    try:
+        return raw.decode(charset or "utf-8", errors="replace")
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
+
+
+def fetch_text_parts(conn: imaplib.IMAP4, msg_uids: list[bytes]):
+    """Fetch only each message's preferred non-attachment plain or HTML MIME part."""
+    started = time.monotonic()
+    status, data = conn.uid(
+        "fetch", b",".join(msg_uids), "(UID RFC822.SIZE BODYSTRUCTURE)"
+    )
+    structure_s = time.monotonic() - started
+    if status != "OK":
+        raise ImapError("UID BODYSTRUCTURE FETCH failed")
+    structures, structure_bytes, message_bytes = _bodystructure_records(data)
+    if set(structures) != set(msg_uids):
+        raise ImapError("UID FETCH returned an incomplete BODYSTRUCTURE batch")
+
+    selected = {}
+    groups = {}
+    for uid in msg_uids:
+        part = _preferred_text_part(structures[uid])
+        if part:
+            _, section, subtype, charset, encoding = part
+            selected[uid] = (subtype, charset, encoding)
+            groups.setdefault(section, []).append(uid)
+
+    bodies = {}
+    body_s = body_bytes = 0
+    for section, uids in groups.items():
+        started = time.monotonic()
+        status, data = conn.uid(
+            "fetch", b",".join(uids), f"(UID BODY.PEEK[{section}])"
+        )
+        body_s += time.monotonic() - started
+        if status != "OK":
+            raise ImapError("UID text-part FETCH failed")
+        for item in data:
+            if not isinstance(item, tuple) or len(item) < 2:
+                continue
+            match = re.search(rb"\bUID\s+(\d+)\b", item[0])
+            if match:
+                bodies[match.group(1)] = item[1]
+                body_bytes += len(item[1])
+        if any(uid not in bodies for uid in uids):
+            raise ImapError("UID FETCH returned an incomplete text-part batch")
+
+    parts = []
+    for uid in msg_uids:
+        if uid not in selected:
+            parts.append((uid, "", ""))
+            continue
+        subtype, charset, encoding = selected[uid]
+        try:
+            body = _decode_text_part(bodies[uid], encoding, charset)
+        except (binascii.Error, ValueError):
+            body = ""
+        parts.append((uid, body, subtype))
+    return parts, {
+        "structure_seconds": structure_s,
+        "body_seconds": body_s,
+        "structure_bytes": structure_bytes,
+        "message_bytes": message_bytes,
+        "body_bytes": body_bytes,
+        "requests": 1 + len(groups),
+    }
 
 
 def parse_message(raw_message: bytes) -> tuple[list[tuple[str, str]], str, str, str, str]:

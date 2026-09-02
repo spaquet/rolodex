@@ -2,7 +2,6 @@
 sync/import into Turso separately with `turso db shell <db> < dump` or `turso db import`."""
 import csv
 import sqlite3
-from collections import defaultdict
 from contextlib import closing
 
 SORTABLE_COLUMNS = {"name", "email", "message_count", "first_seen", "last_seen"}
@@ -31,10 +30,36 @@ CREATE TABLE IF NOT EXISTS extraction_state (
 );
 """
 
+TEMP_SCHEMA = """
+CREATE TEMP TABLE contact_stage (
+    email TEXT NOT NULL,
+    name TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    date TEXT NOT NULL
+);
+CREATE INDEX contact_stage_email_name ON contact_stage (email, name);
+CREATE INDEX contact_stage_email_folder ON contact_stage (email, folder);
+CREATE TEMP TABLE signature_candidates (
+    sender TEXT NOT NULL,
+    folder TEXT NOT NULL,
+    uid INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    PRIMARY KEY (sender, folder)
+);
+CREATE TEMP TABLE signature_targets (
+    sender TEXT PRIMARY KEY,
+    folder TEXT NOT NULL,
+    uid INTEGER NOT NULL,
+    date TEXT NOT NULL
+);
+CREATE INDEX signature_targets_folder_uid ON signature_targets (folder, uid);
+"""
+
 
 class ContactStore:
-    """Accumulates (email, name, folder, date) observations in memory and
-    upserts them into a sqlite/libsql-compatible `contacts` table on flush().
+    """Stages (email, name, folder, date) observations and upserts them into
+    a sqlite/libsql-compatible `contacts` table on flush().
 
     Name-conflict resolution is most-frequent-wins: if the same address
     appears with several display names, the one seen most often survives.
@@ -49,6 +74,7 @@ class ContactStore:
         self.db_path = db_path
         self._conn = sqlite3.connect(db_path)
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA temp_store=FILE")
         self._conn.execute(SCHEMA)
         self._conn.execute(STATE_SCHEMA)
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(contacts)")}
@@ -56,14 +82,10 @@ class ContactStore:
             if column not in columns:
                 self._conn.execute(f"ALTER TABLE contacts ADD COLUMN {column} TEXT")
         self._conn.commit()
-        # per-email tally of {display_name: occurrence_count}, used to pick
-        # the most-frequent name for that address at flush() time
-        self._name_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        self._msg_count: dict[str, int] = defaultdict(int)
-        self._folders: dict[str, set] = defaultdict(set)
-        self._first_seen: dict[str, str] = {}
-        self._last_seen: dict[str, str] = {}
+        self._conn.executescript(TEMP_SCHEMA)
+        self._contacts: list[tuple[str, str, str, str]] = []
         self._signatures: dict[str, tuple[str, str]] = {}
+        self._candidate_ordinal = 0
 
     def record(
         self,
@@ -75,7 +97,7 @@ class ContactStore:
     ):
         """Register one occurrence of an address in a message.
 
-        Buffered in memory only; call flush() to write to the database.
+        Buffered until the next stage() or flush() call.
 
         Args:
             email: Address as found in a From/To/Cc header. Case-folded
@@ -88,15 +110,7 @@ class ContactStore:
         email = email.lower().strip()
         if not email:
             return
-        if name:
-            self._name_counts[email][name] += 1
-        self._msg_count[email] += 1
-        self._folders[email].add(folder)
-        if date:
-            if email not in self._first_seen or date < self._first_seen[email]:
-                self._first_seen[email] = date
-            if email not in self._last_seen or date > self._last_seen[email]:
-                self._last_seen[email] = date
+        self._contacts.append((email, name, folder, date))
         previous = self._signatures.get(email)
         if signature and (not previous or (date and (not previous[1] or date >= previous[1]))):
             self._signatures[email] = (signature, date)
@@ -126,8 +140,77 @@ class ContactStore:
             (host, username, folder),
         ).fetchone()
 
+    def stage(self) -> int:
+        """Move buffered contact observations into disk-backed temporary tables."""
+        count = len(self._contacts)
+        self._conn.executemany(
+            "INSERT INTO contact_stage (email, name, folder, date) VALUES (?, ?, ?, ?)",
+            self._contacts,
+        )
+        self._conn.commit()
+        self._contacts.clear()
+        return count
+
+    def record_signature_target(self, sender: str, folder: str, uid: bytes, date: str):
+        """Stage the newest signature candidate for one sender in one folder."""
+        self._candidate_ordinal += 1
+        self._conn.execute(
+            """
+            INSERT INTO signature_candidates (sender, folder, uid, date, ordinal)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(sender, folder) DO UPDATE SET
+                uid = excluded.uid,
+                date = excluded.date,
+                ordinal = excluded.ordinal
+            WHERE excluded.date != '' AND
+                (signature_candidates.date = '' OR excluded.date >= signature_candidates.date)
+            """,
+            (sender, folder, int(uid), date, self._candidate_ordinal),
+        )
+
+    def finalize_signature_targets(self):
+        """Choose the single newest candidate per sender across all folders."""
+        self._conn.executescript(
+            """
+            DELETE FROM signature_targets;
+            INSERT INTO signature_targets (sender, folder, uid, date)
+            SELECT sender, folder, uid, date
+            FROM (
+                SELECT sender, folder, uid, date,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY sender
+                        ORDER BY date != '' DESC, date DESC, ordinal DESC
+                    ) AS rank
+                FROM signature_candidates
+            )
+            WHERE rank = 1;
+            DELETE FROM signature_candidates;
+            """
+        )
+
+    @property
+    def signature_target_count(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM signature_targets").fetchone()[0]
+
+    def signature_target_folders(self) -> list[str]:
+        return [
+            row[0]
+            for row in self._conn.execute(
+                "SELECT DISTINCT folder FROM signature_targets ORDER BY folder"
+            )
+        ]
+
+    def signature_target_batches(self, folder: str, batch_size: int):
+        with closing(self._conn.cursor()) as cur:
+            cur.execute(
+                "SELECT uid, sender, date FROM signature_targets WHERE folder = ? ORDER BY uid",
+                (folder,),
+            )
+            while rows := cur.fetchmany(batch_size):
+                yield [(str(uid).encode(), sender, date) for uid, sender, date in rows]
+
     def flush(self, checkpoint: tuple[str, str, str, str, int] | None = None):
-        """Write all buffered observations to the `contacts` table.
+        """Write all staged observations to the `contacts` table.
 
         Safe to call multiple times (e.g. once per folder): each call
         upserts on `email`, adding to message_count and expanding the
@@ -136,16 +219,25 @@ class ContactStore:
         When supplied, the extraction checkpoint is committed atomically
         with the contacts so an interrupted retry cannot double-count them.
         """
-        with closing(self._conn.cursor()) as cur:
-            # Union with _signatures: record_signature() can add an email here
-            # without going through record(), so _msg_count alone would miss it
-            # (e.g. the deferred signature-only pass in app.py's run_extraction).
-            for email in self._msg_count.keys() | self._signatures.keys():
-                count = self._msg_count.get(email, 0)
-                names = self._name_counts.get(email, {})
-                best_name = max(names.items(), key=lambda kv: kv[1])[0] if names else None
-                folders = ",".join(sorted(self._folders[email]))
-                signature, signature_seen = self._signatures.get(email, (None, None))
+        self.stage()
+        with closing(self._conn.cursor()) as cur, closing(self._conn.cursor()) as staged:
+            rows = staged.execute(
+                """
+                SELECT contacts.email,
+                    (SELECT name FROM contact_stage AS names
+                     WHERE names.email = contacts.email AND name != ''
+                     GROUP BY name ORDER BY COUNT(*) DESC, name LIMIT 1),
+                    COUNT(*),
+                    (SELECT GROUP_CONCAT(folder, ',') FROM
+                        (SELECT DISTINCT folder FROM contact_stage AS folders
+                         WHERE folders.email = contacts.email ORDER BY folder)),
+                    COALESCE(MIN(NULLIF(date, '')), ''),
+                    COALESCE(MAX(NULLIF(date, '')), '')
+                FROM contact_stage AS contacts
+                GROUP BY contacts.email
+                """
+            )
+            for email, best_name, count, folders, first_seen, last_seen in rows:
                 cur.execute(
                     """
                     INSERT INTO contacts (
@@ -188,13 +280,38 @@ class ContactStore:
                         email,
                         best_name,
                         count,
-                        folders,
-                        self._first_seen.get(email, ""),
-                        self._last_seen.get(email, ""),
-                        signature,
-                        signature_seen,
+                        folders or "",
+                        first_seen,
+                        last_seen,
+                        None,
+                        None,
                     ),
                 )
+            for email, (signature, signature_seen) in self._signatures.items():
+                cur.execute(
+                    """
+                    INSERT INTO contacts (email, name, message_count, folders, first_seen,
+                        last_seen, signature, signature_seen)
+                    VALUES (?, NULL, 0, '', '', '', ?, ?)
+                    ON CONFLICT(email) DO UPDATE SET
+                        signature = CASE
+                            WHEN contacts.signature IS NULL OR
+                                (excluded.signature_seen != '' AND
+                                 (contacts.signature_seen IS NULL OR
+                                  contacts.signature_seen = '' OR
+                                  excluded.signature_seen >= contacts.signature_seen))
+                            THEN excluded.signature ELSE contacts.signature END,
+                        signature_seen = CASE
+                            WHEN contacts.signature IS NULL OR
+                                (excluded.signature_seen != '' AND
+                                 (contacts.signature_seen IS NULL OR
+                                  contacts.signature_seen = '' OR
+                                  excluded.signature_seen >= contacts.signature_seen))
+                            THEN excluded.signature_seen ELSE contacts.signature_seen END
+                    """,
+                    (email, signature, signature_seen),
+                )
+            cur.execute("DELETE FROM contact_stage")
             if checkpoint:
                 cur.execute(
                     """
@@ -207,16 +324,16 @@ class ContactStore:
                     checkpoint,
                 )
         self._conn.commit()
-        self.discard()
-
-    def discard(self):
-        """Discard observations buffered since the last successful flush."""
-        self._name_counts.clear()
-        self._msg_count.clear()
-        self._folders.clear()
-        self._first_seen.clear()
-        self._last_seen.clear()
         self._signatures.clear()
+
+    def discard(self, folder: str | None = None):
+        """Discard observations buffered since the last successful flush."""
+        self._contacts.clear()
+        self._signatures.clear()
+        self._conn.execute("DELETE FROM contact_stage")
+        if folder is not None:
+            self._conn.execute("DELETE FROM signature_candidates WHERE folder = ?", (folder,))
+        self._conn.commit()
 
     def close(self):
         """Close the underlying sqlite connection."""

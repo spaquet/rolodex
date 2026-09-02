@@ -2,6 +2,8 @@
 and extract contacts to sqlite."""
 import imaplib
 import re
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -53,6 +55,15 @@ def format_elapsed(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def peak_rss_mib() -> float:
+    try:
+        import resource
+    except ImportError:
+        return 0.0
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return rss / (1024 * 1024 if sys.platform == "darwin" else 1024)
 
 
 def parse_query(text: str) -> dict:
@@ -370,6 +381,7 @@ class RunScreen(Screen):
         self.username = username
         self.done = False
         self.start_time = time.monotonic()
+        self.log_lines: list[str] = []
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -379,6 +391,9 @@ class RunScreen(Screen):
             yield Static("00:00", id="elapsed")
         with VerticalScroll(id="log-wrap"):
             yield RichLog(id="log", wrap=True, highlight=True, markup=True)
+        with Horizontal(id="log-actions"):
+            yield Button("Copy log", id="copy_log", variant="primary")
+            yield Static("", id="copy_status")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -405,8 +420,21 @@ class RunScreen(Screen):
         """Open the contacts browser on top of this screen without stopping extraction."""
         self.app.push_screen(BrowseScreen())
 
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id != "copy_log":
+            return
+        text = "\n".join(self.log_lines)
+        if sys.platform == "darwin":
+            subprocess.run(["pbcopy"], input=text, text=True, check=True)
+        else:
+            self.app.copy_to_clipboard(text)
+        self.query_one("#copy_status", Static).update(
+            f"[green]Copied {len(self.log_lines)} lines.[/green]"
+        )
+
     def append_log(self, msg: str) -> None:
         """Append a line to the on-screen log (thread-safe)."""
+        self.log_lines.append(re.sub(r"\[/?(?:red|yellow|green)\]", "", msg))
         self.app.call_from_thread(self.query_one("#log", RichLog).write, msg)
 
     def run_extraction(self) -> None:
@@ -423,6 +451,7 @@ class RunScreen(Screen):
         store = ContactStore(self.db_path)
         progress = self.query_one("#progress", ProgressBar)
         status = self.query_one("#folder_status", Static)
+        talon_started = time.monotonic()
         try:
             import talon
 
@@ -432,13 +461,10 @@ class RunScreen(Screen):
             self.done = True
             self.app.call_from_thread(status.update, f"[red]Talon failed to start: {e}[/red]")
             return
+        talon_init_s = time.monotonic() - talon_started
 
         own_address = self.username.lower()
-        # sender -> (folder, uid, date) of the single newest candidate message
-        # seen so far anywhere in this run, used to fetch each sender's
-        # signature exactly once regardless of how many folders/messages
-        # they appear in.
-        sig_targets: dict[str, tuple[str, bytes, str]] = {}
+        total_search_s = total_fetch_s = total_parse_s = total_stage_s = total_commit_s = 0.0
 
         total_folders = len(self.folders)
         for fi, folder in enumerate(self.folders, start=1):
@@ -466,31 +492,40 @@ class RunScreen(Screen):
                 )
 
             last_uid = checkpoint[1] if checkpoint else 0
+            search_started = time.monotonic()
             try:
                 uids = im.search_uids(self.conn, last_uid)
             except im.ImapError as e:
                 self.append_log(f"[red]Skip {folder}: {e}[/red]")
                 continue
+            search_s = time.monotonic() - search_started
+            total_search_s += search_s
 
             self.append_log(f"{folder}: {len(uids)} new messages")
             self.app.call_from_thread(progress.update, total=len(uids) or 1, progress=0)
             done = 0
-            fetch_s = parse_s = 0.0
+            fetch_s = parse_s = stage_s = 0.0
+            header_chars = contact_observations = candidate_hits = 0
+            skipped_bulk = skipped_noreply = skipped_parse = peak_batch_observations = 0
             t_mark = time.monotonic()
             try:
                 for batch, headers_list in im.fetch_header_batches(self.conn, uids):
                     fetch_s += time.monotonic() - t_mark
+                    header_chars += sum(map(len, headers_list))
                     t_parse = time.monotonic()
                     for uid, raw_headers in zip(batch, headers_list):
                         try:
                             if im.is_bulk_message(raw_headers):
+                                skipped_bulk += 1
                                 continue
                             sender = im.parse_sender(raw_headers)
                             if im.is_noreply_sender(sender):
+                                skipped_noreply += 1
                                 continue
                             addresses = im.parse_addresses(raw_headers)
                             date = im.parse_date(raw_headers)
                         except Exception as e:
+                            skipped_parse += 1
                             self.append_log(
                                 f"[yellow]{folder} UID {uid.decode()}: skipped unparseable headers: {e}[/yellow]"
                             )
@@ -500,6 +535,7 @@ class RunScreen(Screen):
                             if domain in self.excluded_domains:
                                 continue
                             store.record(addr, name, folder, date)
+                            contact_observations += 1
                         sender_l = sender.lower()
                         sender_domain = sender_l.split("@")[-1] if "@" in sender_l else ""
                         if (
@@ -507,35 +543,57 @@ class RunScreen(Screen):
                             and sender_l != own_address
                             and sender_domain not in self.excluded_domains
                         ):
-                            prev = sig_targets.get(sender_l)
-                            if not prev or (date and (not prev[2] or date >= prev[2])):
-                                sig_targets[sender_l] = (folder, uid, date)
+                            store.record_signature_target(sender_l, folder, uid, date)
+                            candidate_hits += 1
                     parse_s += time.monotonic() - t_parse
+                    t_stage = time.monotonic()
+                    peak_batch_observations = max(peak_batch_observations, store.stage())
+                    stage_s += time.monotonic() - t_stage
                     done += len(batch)
                     self.app.call_from_thread(progress.update, progress=done)
                     self.app.call_from_thread(
                         status.update,
                         f"Step 1/2 · [{fi}/{total_folders}] Scanning headers: {folder} "
-                        f"({done}/{len(uids)}, IMAP {fetch_s:.1f}s, parse {parse_s:.1f}s)",
+                        f"({done}/{len(uids)}, IMAP {fetch_s:.1f}s, parse {parse_s:.1f}s, "
+                        f"SQLite {stage_s:.1f}s)",
                     )
                     t_mark = time.monotonic()
             except im.ImapError as e:
-                store.discard()
+                store.discard(folder)
+                total_fetch_s += fetch_s
+                total_parse_s += parse_s
+                total_stage_s += stage_s
                 self.append_log(f"[red]Skip {folder}: {e}[/red]")
                 continue
             self.app.call_from_thread(progress.update, progress=len(uids) or 1)
 
             newest_uid = int(uids[-1]) if uids else last_uid
+            commit_started = time.monotonic()
             store.flush((self.host, self.username, folder, uidvalidity, newest_uid))
+            commit_s = time.monotonic() - commit_started
+            total_fetch_s += fetch_s
+            total_parse_s += parse_s
+            total_stage_s += stage_s
+            total_commit_s += commit_s
+            self.append_log(
+                f"{folder}: metrics messages={len(uids)}, header text={header_chars / 1048576:.2f} MiB, "
+                f"contacts={contact_observations}, candidates={candidate_hits}, "
+                f"skipped bulk/no-reply/parse={skipped_bulk}/{skipped_noreply}/{skipped_parse}, "
+                f"peak batch observations={peak_batch_observations}, peak RSS={peak_rss_mib():.1f} MiB, "
+                f"search={search_s:.2f}s, "
+                f"IMAP={fetch_s:.2f}s, parse={parse_s:.2f}s, "
+                f"SQLite stage/commit={stage_s:.2f}/{commit_s:.2f}s"
+            )
 
-        by_folder: dict[str, list[bytes]] = {}
-        for sender_l, (folder, uid, _) in sig_targets.items():
-            by_folder.setdefault(folder, []).append(uid)
-
-        total_targets = sum(len(uids) for uids in by_folder.values())
+        store.finalize_signature_targets()
+        target_folders = store.signature_target_folders()
+        total_targets = store.signature_target_count
         self.append_log(
             f"Header scan complete: {total_targets} senders queued for signature extraction"
         )
+        signature_fetch_s = signature_talon_s = 0.0
+        signature_message_bytes = signature_structure_bytes = signature_text_bytes = 0
+        signature_requests = 0
         if total_targets:
             self.app.call_from_thread(
                 status.update, f"Step 2/2 · Extracting signatures: 0/{total_targets}"
@@ -543,22 +601,28 @@ class RunScreen(Screen):
             self.app.call_from_thread(progress.update, total=total_targets, progress=0)
             done = 0
             fetch_s = talon_s = 0.0
-            for fj, (folder, sig_uids) in enumerate(by_folder.items(), start=1):
+            signature_batch = 0
+            for fj, folder in enumerate(target_folders, start=1):
                 try:
                     im.select_folder(self.conn, folder)
                 except im.ImapError as e:
                     self.append_log(f"[red]{folder}: could not reselect for signatures: {e}[/red]")
-                    done += len(sig_uids)
-                    self.app.call_from_thread(progress.update, progress=done)
                     continue
-                t_mark = time.monotonic()
                 try:
-                    for batch, messages in im.fetch_message_batches(self.conn, sig_uids):
-                        fetch_s += time.monotonic() - t_mark
+                    for targets in store.signature_target_batches(folder, im.MESSAGE_BATCH_SIZE):
+                        signature_batch += 1
+                        target_by_uid = {uid: (sender, date) for uid, sender, date in targets}
+                        parts, metrics = im.fetch_text_parts(self.conn, list(target_by_uid))
+                        batch_fetch_s = metrics["structure_seconds"] + metrics["body_seconds"]
+                        fetch_s += batch_fetch_s
+                        signature_message_bytes += metrics["message_bytes"]
+                        signature_structure_bytes += metrics["structure_bytes"]
+                        signature_text_bytes += metrics["body_bytes"]
+                        signature_requests += metrics["requests"]
                         t_talon = time.monotonic()
-                        for uid, raw_message in zip(batch, messages):
+                        for uid, body, subtype in parts:
+                            sender, date = target_by_uid[uid]
                             try:
-                                _, date, sender, body, subtype = im.parse_message(raw_message)
                                 found_signature = im.extract_signature(body, subtype, sender)
                             except Exception as e:
                                 self.append_log(
@@ -568,18 +632,26 @@ class RunScreen(Screen):
                             if found_signature:
                                 store.record_signature(sender, found_signature, date)
                         talon_s += time.monotonic() - t_talon
-                        done += len(batch)
+                        done += len(targets)
+                        self.append_log(
+                            f"Signature batch {signature_batch}: messages={len(targets)}, "
+                            f"total size={metrics['message_bytes'] / 1024:.1f} KiB, "
+                            f"structure={metrics['structure_bytes'] / 1024:.1f} KiB/"
+                            f"{metrics['structure_seconds']:.2f}s, text={metrics['body_bytes'] / 1024:.1f} KiB/"
+                            f"{metrics['body_seconds']:.2f}s, requests={metrics['requests']}"
+                        )
                         self.app.call_from_thread(progress.update, progress=done)
                         self.app.call_from_thread(
                             status.update,
                             f"Step 2/2 · Extracting signatures: {done}/{total_targets} "
-                            f"(folder {fj}/{len(by_folder)}: {folder}, "
+                            f"(folder {fj}/{len(target_folders)}: {folder}, "
                             f"IMAP {fetch_s:.1f}s, Talon {talon_s:.1f}s)",
                         )
-                        t_mark = time.monotonic()
                 except im.ImapError as e:
                     self.append_log(f"[red]{folder}: signature extraction pass failed: {e}[/red]")
                 store.flush()
+            signature_fetch_s = fetch_s
+            signature_talon_s = talon_s
             self.append_log("Signature extraction complete")
 
         count = store.contact_count
@@ -592,6 +664,16 @@ class RunScreen(Screen):
 
         self.app.call_from_thread(
             status.update, f"[green]Done. {count} unique contacts written to {self.db_path}[/green]"
+        )
+        self.append_log(
+            f"Run metrics: elapsed={time.monotonic() - self.start_time:.2f}s, "
+            f"Talon init={talon_init_s:.2f}s, header search/IMAP/parse/SQLite-stage/commit="
+            f"{total_search_s:.2f}/{total_fetch_s:.2f}/{total_parse_s:.2f}/"
+            f"{total_stage_s:.2f}/{total_commit_s:.2f}s, signature IMAP/Talon="
+            f"{signature_fetch_s:.2f}/{signature_talon_s:.2f}s, signature total/structure/text="
+            f"{signature_message_bytes / 1048576:.2f}/{signature_structure_bytes / 1048576:.2f}/"
+            f"{signature_text_bytes / 1048576:.2f} MiB "
+            f"in {signature_requests} requests, peak RSS={peak_rss_mib():.1f} MiB"
         )
         self.append_log("Press q to quit.")
 
@@ -947,6 +1029,9 @@ class RolodexApp(App):
         margin: 0 2 1 2;
     }
     #log { background: $boost; }
+    #log-actions { height: 3; margin: 0 2 1 2; }
+    #log-actions Button { width: 18; margin-right: 1; }
+    #copy_status { height: 3; content-align: left middle; }
     #folder_status { padding: 1 2; }
     #progress-row { height: 1; margin: 0 2 1 2; }
     #progress-row ProgressBar { width: 1fr; }

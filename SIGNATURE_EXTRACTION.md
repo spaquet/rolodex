@@ -196,14 +196,12 @@ the fork. Do not retrain it merely to refresh a dependency.
 
 ### IMAP fetch
 
-The existing extraction fetches headers only. Signature extraction needs MIME
-content, so the signature-enabled path will fetch complete messages with
-`BODY.PEEK[]` in small batches. `PEEK` preserves the message's unread state.
-
-Fetching complete messages is the simplest provider-independent implementation.
-It may transfer attachments, but the bytes remain in memory and are discarded
-after parsing. If mailbox measurements show that attachment traffic is a real
-problem, add `BODYSTRUCTURE`-guided text-part fetching later.
+The header pass fetches headers only. For signature extraction, a batched
+`BODYSTRUCTURE` request selects the preferred non-attachment `text/plain` part,
+falling back to `text/html`, then `BODY.PEEK[section]` fetches only that MIME
+section. `PEEK` preserves the message's unread state. Sender and date come from
+the header pass's temporary signature target, so full messages, attachments,
+and duplicate headers are not transferred.
 
 Header-only extraction remains available only if the UI retains an explicit
 “scan signatures” choice. Otherwise the existing fetch function will be
@@ -373,13 +371,14 @@ Extraction is now two passes per run:
    `fetch_header_batches` pulls `FROM TO CC DATE LIST-UNSUBSCRIBE LIST-ID
    PRECEDENCE` only. This builds every contact row exactly as before, and
    also picks — for each sender seen anywhere in the run, across every
-   selected folder — the single newest-dated candidate message. Contacts and
-   the folder's checkpoint are flushed together immediately after this pass,
-   same crash-safety guarantee as before.
+   selected folder — the single newest-dated candidate message. Each fetched
+   batch is staged in disk-backed temporary SQLite tables to bound Python
+   memory. Contacts and the folder's checkpoint are committed together after
+   the full folder succeeds, preserving the same crash-safety guarantee.
 2. **Signature pass** (once, after all folders' header passes complete):
-   fetches full bodies (`BODY.PEEK[]`) for only that deduped set — at most
-   one message per sender for the entire run, not per folder and never the
-   sender's older history. Talon only ever sees each sender's single
+   fetches only the preferred plain/HTML MIME section for that deduped set —
+   at most one message per sender for the entire run, not per folder and never
+   the sender's older history or attachments. Talon only ever sees each sender's single
    newest message. Results are written via the new
    `ContactStore.record_signature`, which updates only the signature columns
    without re-touching `message_count`/`folders`/first-seen/last-seen (those

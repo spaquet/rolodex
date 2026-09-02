@@ -1,9 +1,10 @@
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from textual.widgets import Input
 
-from app import BrowseScreen, DatabasePicker, RolodexApp
+from app import BrowseScreen, DatabasePicker, RolodexApp, RunScreen
 
 
 class FakeStore:
@@ -22,6 +23,14 @@ class TestBrowseScreen(BrowseScreen):
     def load_db(self):
         self.store = FakeStore()
         self.run_search()
+
+
+class IdleRunScreen(RunScreen):
+    def on_mount(self):
+        pass
+
+    def run_extraction(self):
+        pass
 
 
 class LiveSearchTest(unittest.IsolatedAsyncioTestCase):
@@ -48,6 +57,21 @@ class LiveSearchTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertIsInstance(app.screen, DatabasePicker)
             self.assertEqual(app.screen.directory, Path.cwd())
+
+    async def test_run_log_can_be_copied_on_macos(self):
+        app = RolodexApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = IdleRunScreen(None, [], [], "test.db", "host", "user")
+            screen.log_lines = ["first", "second"]
+            app.push_screen(screen)
+            await pilot.pause()
+
+            with patch("app.sys.platform", "darwin"), patch("app.subprocess.run") as run:
+                await pilot.click("#copy_log")
+
+            run.assert_called_once_with(
+                ["pbcopy"], input="first\nsecond", text=True, check=True
+            )
 
 
 if __name__ == "__main__":
