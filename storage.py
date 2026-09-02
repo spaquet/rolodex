@@ -137,7 +137,11 @@ class ContactStore:
         with the contacts so an interrupted retry cannot double-count them.
         """
         with closing(self._conn.cursor()) as cur:
-            for email, count in self._msg_count.items():
+            # Union with _signatures: record_signature() can add an email here
+            # without going through record(), so _msg_count alone would miss it
+            # (e.g. the deferred signature-only pass in app.py's run_extraction).
+            for email in self._msg_count.keys() | self._signatures.keys():
+                count = self._msg_count.get(email, 0)
                 names = self._name_counts.get(email, {})
                 best_name = max(names.items(), key=lambda kv: kv[1])[0] if names else None
                 folders = ",".join(sorted(self._folders[email]))
@@ -152,9 +156,13 @@ class ContactStore:
                     ON CONFLICT(email) DO UPDATE SET
                         name = CASE WHEN excluded.name IS NOT NULL THEN excluded.name ELSE contacts.name END,
                         message_count = contacts.message_count + excluded.message_count,
-                        folders = excluded.folders,
-                        first_seen = MIN(COALESCE(contacts.first_seen, excluded.first_seen), excluded.first_seen),
-                        last_seen = MAX(COALESCE(contacts.last_seen, excluded.last_seen), excluded.last_seen),
+                        folders = CASE WHEN excluded.folders != '' THEN excluded.folders ELSE contacts.folders END,
+                        first_seen = CASE WHEN excluded.first_seen != ''
+                            THEN MIN(COALESCE(contacts.first_seen, excluded.first_seen), excluded.first_seen)
+                            ELSE contacts.first_seen END,
+                        last_seen = CASE WHEN excluded.last_seen != ''
+                            THEN MAX(COALESCE(contacts.last_seen, excluded.last_seen), excluded.last_seen)
+                            ELSE contacts.last_seen END,
                         signature = CASE
                             WHEN excluded.signature IS NULL THEN contacts.signature
                             WHEN contacts.signature IS NULL THEN excluded.signature
