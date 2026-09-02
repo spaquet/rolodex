@@ -442,7 +442,9 @@ class RunScreen(Screen):
 
         total_folders = len(self.folders)
         for fi, folder in enumerate(self.folders, start=1):
-            self.app.call_from_thread(status.update, f"[{fi}/{total_folders}] Scanning: {folder}")
+            self.app.call_from_thread(
+                status.update, f"Step 1/2 · [{fi}/{total_folders}] Scanning headers: {folder}"
+            )
             try:
                 uidvalidity = im.select_folder(self.conn, folder)
             except im.ImapError as e:
@@ -506,6 +508,11 @@ class RunScreen(Screen):
                                 sig_targets[sender_l] = (folder, uid, date)
                     done += len(batch)
                     self.app.call_from_thread(progress.update, progress=done)
+                    self.app.call_from_thread(
+                        status.update,
+                        f"Step 1/2 · [{fi}/{total_folders}] Scanning headers: {folder} "
+                        f"({done}/{len(uids)})",
+                    )
             except im.ImapError as e:
                 store.discard()
                 self.append_log(f"[red]Skip {folder}: {e}[/red]")
@@ -520,11 +527,16 @@ class RunScreen(Screen):
             by_folder.setdefault(folder, []).append(uid)
 
         total_targets = sum(len(uids) for uids in by_folder.values())
+        self.append_log(
+            f"Header scan complete: {total_targets} senders queued for signature extraction"
+        )
         if total_targets:
-            self.append_log(f"Extracting signatures for {total_targets} senders")
+            self.app.call_from_thread(
+                status.update, f"Step 2/2 · Extracting signatures: 0/{total_targets}"
+            )
             self.app.call_from_thread(progress.update, total=total_targets, progress=0)
             done = 0
-            for folder, sig_uids in by_folder.items():
+            for fj, (folder, sig_uids) in enumerate(by_folder.items(), start=1):
                 try:
                     im.select_folder(self.conn, folder)
                 except im.ImapError as e:
@@ -547,9 +559,15 @@ class RunScreen(Screen):
                                 store.record_signature(sender, found_signature, date)
                         done += len(batch)
                         self.app.call_from_thread(progress.update, progress=done)
+                        self.app.call_from_thread(
+                            status.update,
+                            f"Step 2/2 · Extracting signatures: {done}/{total_targets} "
+                            f"(folder {fj}/{len(by_folder)}: {folder})",
+                        )
                 except im.ImapError as e:
                     self.append_log(f"[red]{folder}: signature extraction pass failed: {e}[/red]")
                 store.flush()
+            self.append_log("Signature extraction complete")
 
         count = store.contact_count
         store.close()
